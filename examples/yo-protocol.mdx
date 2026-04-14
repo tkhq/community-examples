@@ -1,0 +1,515 @@
+---
+title: 'Use Turnkey wallets with YO Protocol'
+sidebarTitle: "YO Protocol integration"
+---
+
+## Overview
+
+[YO Protocol](https://yo.xyz) is an ERC-4626 yield vault protocol deployed on Ethereum, Base, Arbitrum, X Layer, and Katana. It offers yield-bearing vaults — yoUSD, yoETH, yoBTC, yoEUR, yoGOLD, and yoUSDT — that accept underlying tokens (for example, USDC) and return yield-bearing vault shares.
+
+This guide walks through how to use **Turnkey** wallets to fetch vault data from the YO API, read on-chain balances, deposit into a vault via the YO Gateway contract, and redeem shares back to the underlying asset.
+
+---
+
+## Getting started
+
+Before you begin, make sure you've followed the [Turnkey Quickstart guide](https://docs.turnkey.com/getting-started/quickstart).
+You should have:
+
+- A Turnkey **organization** with an **API key pair** (Profile → Create API Key)
+- A Turnkey **private key** or **wallet** with a funded address on any supported chain
+
+YO Protocol vaults are deployed on **Ethereum**, **Base**, **Arbitrum**, **X Layer**, and **Katana**. This guide uses yoUSD as an example, but the same pattern applies to all vaults.
+
+---
+
+## Install dependencies
+
+```bash
+npm install @turnkey/viem @turnkey/http @turnkey/api-key-stamper viem
+```
+
+---
+
+## Set up the Turnkey viem signer
+
+Connect your existing Turnkey wallet and create viem clients for YO Protocol's supported chains.
+
+```tsx
+import { createAccount } from "@turnkey/viem";
+import { TurnkeyClient } from "@turnkey/http";
+import { ApiKeyStamper } from "@turnkey/api-key-stamper";
+import { createPublicClient, createWalletClient, http } from "viem";
+import { mainnet, base, arbitrum, xLayer, defineChain } from "viem/chains";
+
+const katana = defineChain({
+  id: 747474,
+  name: "Katana",
+  nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+  rpcUrls: { default: { http: ["https://rpc.katanarpc.com"] } },
+});
+
+const turnkeyClient = new TurnkeyClient(
+  { baseUrl: process.env.TURNKEY_API_BASE_URL! },
+  new ApiKeyStamper({
+    apiPublicKey: process.env.TURNKEY_API_PUBLIC_KEY!,
+    apiPrivateKey: process.env.TURNKEY_API_PRIVATE_KEY!,
+  })
+);
+
+const turnkeyAccount = await createAccount({
+  client: turnkeyClient,
+  organizationId: process.env.TURNKEY_ORGANIZATION_ID!,
+  signWith: process.env.TURNKEY_SIGN_WITH!,
+});
+
+// YO Protocol supported chains
+const SUPPORTED_CHAINS = {
+  1: mainnet, 8453: base, 42161: arbitrum, 196: xLayer, 747474: katana,
+} as const;
+
+const publicClients = Object.fromEntries(
+  Object.entries(SUPPORTED_CHAINS).map(([id, chain]) => [
+    id, createPublicClient({ chain, transport: http() }),
+  ])
+) as Record<keyof typeof SUPPORTED_CHAINS, ReturnType<typeof createPublicClient>>;
+
+const walletClients = Object.fromEntries(
+  Object.entries(SUPPORTED_CHAINS).map(([id, chain]) => [
+    id, createWalletClient({ account: turnkeyAccount, chain, transport: http() }),
+  ])
+) as Record<keyof typeof SUPPORTED_CHAINS, ReturnType<typeof createWalletClient>>;
+
+// Select chain
+const chainId = 8453;
+const publicClient = publicClients[chainId];
+const walletClient = walletClients[chainId];
+const userAddress = turnkeyAccount.address;
+```
+
+---
+
+## Fetch vault data from the YO API
+
+The YO API provides vault statistics including TVL, historical yield, and share prices — no on-chain calls needed.
+
+```tsx
+import type { Address } from "viem";
+
+const YO_API = "https://api.yo.xyz";
+
+interface FormattedValue {
+  raw: string | number;
+  formatted: string;
+}
+
+interface VaultAsset {
+  name: string;
+  symbol: string;
+  decimals: number;
+  address: string;
+  coingeckoId?: string;
+}
+
+interface VaultStats {
+  id: string;
+  name: string;
+  type: "Deposit" | "Secondary";
+  asset: VaultAsset;
+  shareAsset: VaultAsset;
+  sharePrice: FormattedValue;
+  chain: { id: number; name: string };
+  contracts: { vaultAddress: string; authorityAddress?: string };
+  tvl: FormattedValue;
+  yield: { "1d": string | null; "7d": string | null; "30d": string | null };
+  merklRewardYield?: string;
+  cap: FormattedValue;
+}
+
+// Fetch all vault stats
+const response = await fetch(`${YO_API}/api/v1/vault/stats?secondary=true`);
+const { data: vaults }: { data: VaultStats[] } = await response.json();
+
+// Pick a vault — for example yoUSD, yoETH, yoBTC, yoEUR, yoGOLD, yoUSDT
+const vault = vaults.find(
+  (v) => v.shareAsset.symbol === "yoUSD" && v.type === "Deposit"
+);
+
+if (!vault) throw new Error("Vault not found");
+
+// Derive addresses and decimals from the API response
+const vaultAddress = vault.contracts.vaultAddress as Address;
+const underlyingAddress = vault.asset.address as Address;
+const underlyingDecimals = vault.asset.decimals;
+const underlyingSymbol = vault.asset.symbol;
+
+console.log(`${vault.name} on chain ${vault.chain.id}`);
+console.log("Underlying:", underlyingSymbol, underlyingDecimals, "decimals");
+console.log("TVL:", vault.tvl.formatted);
+console.log("7d APY:", vault.yield["7d"]);
+console.log("Share Price:", vault.sharePrice.formatted);
+```
+
+All subsequent code uses `vaultAddress`, `underlyingAddress`, `underlyingDecimals`, and `underlyingSymbol` derived from the API — so switching to a different vault (e.g. yoETH/WETH with 18 decimals) requires no other changes.
+
+---
+
+## Fetch user balances from the YO API
+
+The YO API returns the user's wallet balances across all supported chains — useful for showing available assets before a deposit.
+
+```tsx
+interface UserBalanceAsset {
+  chainId: number;
+  chainName: string;
+  contractAddress: string | null;
+  name: string;
+  symbol: string;
+  decimals: number;
+  type: "NATIVE" | "ERC20";
+  balance: string;
+  balanceUsd: string;
+  balanceRaw: string;
+  price: string;
+  logo: string;
+}
+
+interface UserBalances {
+  totalBalanceUsd: string;
+  assets: UserBalanceAsset[];
+}
+
+const balanceRes = await fetch(
+  `${YO_API}/api/v1/user/balance/${userAddress}`
+);
+const { data: userBalances }: { data: UserBalances } =
+  await balanceRes.json();
+
+console.log("Total balance (USD):", userBalances.totalBalanceUsd);
+
+for (const asset of userBalances.assets) {
+  console.log(
+    `${asset.symbol} on chain ${asset.chainId}:`,
+    `${asset.balance} ($${asset.balanceUsd})`,
+    `contract: ${asset.contractAddress}`
+  );
+}
+
+// Filter for the vault's underlying asset across chains
+const depositEligible = userBalances.assets.filter(
+  (a) => a.symbol === underlyingSymbol
+);
+console.log(`${underlyingSymbol} balances:`, depositEligible);
+```
+
+---
+
+## Fetch user performance from the YO API
+
+The YO API tracks realized and unrealized P&L for each user per vault.
+
+```tsx
+interface PerformanceValue {
+  raw: number;
+  formatted: string;
+}
+
+interface UserPerformance {
+  realized: PerformanceValue;
+  unrealized: PerformanceValue;
+}
+
+// Network name must match the API format: "ethereum", "base", "arbitrum", "xlayer", "katana"
+const CHAIN_TO_NETWORK: Record<number, string> = {
+  1: "ethereum",
+  8453: "base",
+  42161: "arbitrum",
+  196: "xlayer",
+  747474: "katana",
+};
+
+const network = CHAIN_TO_NETWORK[chainId];
+
+const perfRes = await fetch(
+  `${YO_API}/api/v1/performance/user/${network}/${vaultAddress}/${userAddress}`
+);
+const { data: performance }: { data: UserPerformance } =
+  await perfRes.json();
+
+console.log("Unrealized P&L:", performance.unrealized.formatted, underlyingSymbol);
+console.log("Realized P&L:", performance.realized.formatted, underlyingSymbol);
+```
+
+---
+
+## Contract ABIs and constants
+
+Define the ABIs and constants used for on-chain reads, deposits, and redemptions. The YO Gateway address is the same on all supported chains.
+
+```tsx
+import { formatUnits, parseUnits } from "viem";
+
+const YO_GATEWAY: Address = "0xF1EeE0957267b1A474323Ff9CfF7719E964969FA";
+const PARTNER_ID = 9999; // Default — DM @yield_intern on X for a dedicated ID
+
+const erc20Abi = [
+  {
+    type: "function",
+    name: "balanceOf",
+    stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "allowance",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "approve",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ type: "bool" }],
+  },
+] as const;
+
+const erc4626Abi = [
+  ...erc20Abi,
+  {
+    type: "function",
+    name: "convertToAssets",
+    stateMutability: "view",
+    inputs: [{ name: "shares", type: "uint256" }],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "totalAssets",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ type: "uint256" }],
+  },
+] as const;
+
+const yoGatewayAbi = [
+  {
+    type: "function",
+    name: "deposit",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "yoVault", type: "address" },
+      { name: "assets", type: "uint256" },
+      { name: "minSharesOut", type: "uint256" },
+      { name: "receiver", type: "address" },
+      { name: "partnerId", type: "uint32" },
+    ],
+    outputs: [{ name: "sharesOut", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "quotePreviewDeposit",
+    stateMutability: "view",
+    inputs: [
+      { name: "yoVault", type: "address" },
+      { name: "assets", type: "uint256" },
+    ],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "redeem",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "yoVault", type: "address" },
+      { name: "shares", type: "uint256" },
+      { name: "minAssetsOut", type: "uint256" },
+      { name: "receiver", type: "address" },
+      { name: "partnerId", type: "uint32" },
+    ],
+    outputs: [{ name: "assetsOrRequestId", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "quotePreviewRedeem",
+    stateMutability: "view",
+    inputs: [
+      { name: "yoVault", type: "address" },
+      { name: "shares", type: "uint256" },
+    ],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "event",
+    name: "YoGatewayRedeem",
+    inputs: [
+      { name: "partnerId", type: "uint32", indexed: true },
+      { name: "yoVault", type: "address", indexed: true },
+      { name: "receiver", type: "address", indexed: true },
+      { name: "shares", type: "uint256", indexed: false },
+      { name: "assetsOrRequestId", type: "uint256", indexed: false },
+      { name: "instant", type: "bool", indexed: false },
+    ],
+  },
+] as const;
+```
+
+---
+
+## Read on-chain balances
+
+Read the user's vault position (shares and underlying asset value) using the ERC-4626 interface.
+
+```tsx
+const shares = await publicClient.readContract({
+  address: vaultAddress,
+  abi: erc4626Abi,
+  functionName: "balanceOf",
+  args: [userAddress],
+});
+
+const assets = await publicClient.readContract({
+  address: vaultAddress,
+  abi: erc4626Abi,
+  functionName: "convertToAssets",
+  args: [shares],
+});
+
+console.log("Shares:", formatUnits(shares, underlyingDecimals));
+console.log(`Underlying ${underlyingSymbol}:`, formatUnits(assets, underlyingDecimals));
+```
+
+---
+
+## Deposit into a vault
+
+Deposit the underlying asset into a vault through the YO Gateway. The gateway provides slippage protection via the `minSharesOut` parameter.
+
+The gateway's `deposit` and `redeem` functions accept a `partnerId` (`uint32`) used to attribute volume to your integration. The default value `9999` is unassigned. To get a custom partner ID for your project, reach out to [@yield_intern](https://x.com/yield_intern).
+
+```tsx
+const depositAmount = parseUnits("100", underlyingDecimals); // 100 in underlying token units
+
+// Step 1: Check and set allowance
+const allowance = await publicClient.readContract({
+  address: underlyingAddress,
+  abi: erc20Abi,
+  functionName: "allowance",
+  args: [userAddress, YO_GATEWAY],
+});
+
+if (allowance < depositAmount) {
+  const approveHash = await walletClient.writeContract({
+    address: underlyingAddress,
+    abi: erc20Abi,
+    functionName: "approve",
+    args: [YO_GATEWAY, depositAmount],
+  });
+  await publicClient.waitForTransactionReceipt({ hash: approveHash });
+}
+
+// Step 2: Quote expected shares and apply 0.5% slippage
+const expectedShares = await publicClient.readContract({
+  address: YO_GATEWAY,
+  abi: yoGatewayAbi,
+  functionName: "quotePreviewDeposit",
+  args: [vaultAddress, depositAmount],
+});
+
+const minSharesOut = (expectedShares * 9950n) / 10000n;
+
+// Step 3: Execute deposit
+const depositHash = await walletClient.writeContract({
+  address: YO_GATEWAY,
+  abi: yoGatewayAbi,
+  functionName: "deposit",
+  args: [vaultAddress, depositAmount, minSharesOut, userAddress, PARTNER_ID],
+});
+
+await publicClient.waitForTransactionReceipt({ hash: depositHash });
+
+console.log("Deposit confirmed:", depositHash);
+console.log("Expected shares:", formatUnits(expectedShares, underlyingDecimals));
+```
+
+---
+
+## Redeem from a vault
+
+Redeem vault shares back to the underlying asset via the YO Gateway. Redemptions can be **instant** (if the vault has idle liquidity) or **queued** (processed within 24 hours).
+
+```tsx
+const redeemShares = parseUnits("50", underlyingDecimals); // 50 shares
+
+// Step 1: Check and set share allowance on the vault token
+const shareAllowance = await publicClient.readContract({
+  address: vaultAddress,
+  abi: erc20Abi,
+  functionName: "allowance",
+  args: [userAddress, YO_GATEWAY],
+});
+
+if (shareAllowance < redeemShares) {
+  const approveHash = await walletClient.writeContract({
+    address: vaultAddress,
+    abi: erc20Abi,
+    functionName: "approve",
+    args: [YO_GATEWAY, redeemShares],
+  });
+  await publicClient.waitForTransactionReceipt({ hash: approveHash });
+}
+
+// Step 2: Quote expected assets and apply 0.5% slippage
+const expectedAssets = await publicClient.readContract({
+  address: YO_GATEWAY,
+  abi: yoGatewayAbi,
+  functionName: "quotePreviewRedeem",
+  args: [vaultAddress, redeemShares],
+});
+
+const minAssetsOut = (expectedAssets * 9950n) / 10000n;
+
+// Step 3: Execute redeem via gateway
+const redeemHash = await walletClient.writeContract({
+  address: YO_GATEWAY,
+  abi: yoGatewayAbi,
+  functionName: "redeem",
+  args: [vaultAddress, redeemShares, minAssetsOut, userAddress, PARTNER_ID],
+});
+
+await publicClient.waitForTransactionReceipt({ hash: redeemHash });
+
+console.log("Redeem confirmed:", redeemHash);
+console.log(`Expected ${underlyingSymbol}:`, formatUnits(expectedAssets, underlyingDecimals));
+```
+
+> **Note:** The gateway emits a `YoGatewayRedeem` event with an `instant` boolean.
+> If `instant` is `true`, the underlying assets are transferred immediately.
+> If `false`, the redemption is queued and processed within 24 hours.
+
+---
+
+## Summary
+
+You've now learned how to:
+
+- Connect a **Turnkey wallet** and create multi-chain viem clients
+- Fetch vault statistics (TVL, APY, share price) from the **YO API**
+- Fetch user wallet balances across chains to find **deposit-eligible assets**
+- Fetch user **realized and unrealized P&L** per vault
+- Read on-chain vault positions using the **ERC-4626** interface
+- Deposit underlying tokens into a vault via the **YO Gateway** with slippage protection
+- Redeem vault shares back to the underlying asset and detect **instant vs queued** redemptions
+
+---
+
+*Contributed by [YO Protocol](https://yo.xyz)*
+
