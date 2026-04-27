@@ -175,18 +175,10 @@ Initialize the relayer inside a `useEffect` (requires browser environment for `w
 // src/components/providers.tsx (continued)
 import {
   ZamaProvider, RelayerWeb, IndexedDBStorage, indexedDBStorage,
-  ZamaSDKEvents, savePendingUnshield,
 } from "@zama-fhe/react-sdk";
-import type { Address } from "viem";
 import { zamaConfig } from "@/lib/chain-config";
 
 const sessionDBStorage = new IndexedDBStorage("SessionStore");
-
-// Exported so UnshieldPanel can tell onEvent which token is being unshielded.
-let activeUnshieldToken: Address | null = null;
-export function setActiveUnshieldToken(addr: Address | null) {
-  activeUnshieldToken = addr;
-}
 
 // Inside useEffect([]):
 setRelayer(new RelayerWeb({
@@ -208,10 +200,7 @@ return (
     storage={indexedDBStorage}
     sessionStorage={sessionDBStorage}
     onEvent={(event) => {
-      if (event.type === ZamaSDKEvents.UnshieldPhase1Submitted && activeUnshieldToken) {
-        savePendingUnshield(indexedDBStorage, activeUnshieldToken, event.txHash).catch(console.error);
-        activeUnshieldToken = null;
-      }
+      window.dispatchEvent(new CustomEvent(event.type, { detail: event }));
     }}
   >
     {children}
@@ -494,14 +483,16 @@ function TransferPanel({ wrapperAddress }: { wrapperAddress: Address }) {
 Unshield is a **two-phase** operation and is not immediate. Phase 1 submits the on-chain unwrap request; phase 2 waits for the KMS to decrypt the ciphertext and finalize the withdrawal — tokens remain locked until phase 2 completes. If the user closes the app between phases, the pending unwrap hash is persisted and can be resumed.
 
 ```tsx
+import { useEffect } from "react";
 import {
   useUnshield,
   useResumeUnshield,
   clearPendingUnshield,
+  savePendingUnshield,
+  ZamaSDKEvents,
   indexedDBStorage,
 } from "@zama-fhe/react-sdk";
 import type { Hex, Address } from "viem";
-import { setActiveUnshieldToken } from "@/components/providers";
 
 function UnshieldPanel({
   wrapperAddress,
@@ -521,8 +512,18 @@ function UnshieldPanel({
     wrapperAddress,
   });
 
+  // Persist the unwrap tx hash when phase 1 completes so the flow can be
+  // resumed if the user closes the app before phase 2 finalizes.
+  useEffect(() => {
+    function handlePhase1(e: Event) {
+      const txHash = (e as CustomEvent<{ txHash: Hex }>).detail.txHash;
+      savePendingUnshield(indexedDBStorage, wrapperAddress, txHash).catch(console.error);
+    }
+    window.addEventListener(ZamaSDKEvents.UnshieldPhase1Submitted, handlePhase1);
+    return () => window.removeEventListener(ZamaSDKEvents.UnshieldPhase1Submitted, handlePhase1);
+  }, [wrapperAddress]);
+
   function handleUnshield(amount: bigint) {
-    setActiveUnshieldToken(wrapperAddress);
     unshield.mutate(
       { amount },
       {
@@ -532,7 +533,6 @@ function UnshieldPanel({
           );
           onSuccess();
         },
-        onError: () => setActiveUnshieldToken(null),
       },
     );
   }
