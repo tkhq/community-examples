@@ -12,7 +12,7 @@ This guide shows how to use Turnkey embedded wallets to interact with Zama confi
 - **Shield** — lock ERC-20 tokens into a confidential wrapper
 - **Decrypt balance** — read their encrypted balance with a wallet-signed session key
 - **Transfer confidentially** — send tokens without exposing the amount on-chain
-- **Unshield** — convert confidential tokens back to standard ERC-20 (two-phase)
+- **Unshield** — convert confidential tokens back to standard ERC-20
 
 Turnkey handles key management and transaction signing. The Zama SDK handles all encryption and on-chain coordination. The integration point is Zama's `GenericSigner` interface, implemented here as a thin adapter over Turnkey-backed viem clients.
 
@@ -78,9 +78,6 @@ import { sepolia } from "viem/chains";
 
 export const zamaConfig = SepoliaConfig;
 export const viemChain = sepolia;
-
-// Sepolia testnet-only helper.
-export const isTestnet = true;
 ```
 
 The snippets below are focused extracts. In a real app, keep `signer` and `relayer` in component state and initialize them inside `useEffect` after the Turnkey session is ready.
@@ -330,7 +327,8 @@ function ShieldPanel({
 }) {
   const { signer } = useZamaSDK();
   const shield = useShield({ tokenAddress: wrapperAddress });
-  const [shieldError, setShieldError] = useState<string | null>(null);
+  const [isApproving, setIsApproving] = useState(false);
+  const [approveError, setApproveError] = useState<string | null>(null);
 
   // Perform ERC-20 approval with a confirmed receipt before shielding.
   async function preApprove(amount: bigint): Promise<void> {
@@ -355,21 +353,26 @@ function ShieldPanel({
   }
 
   async function handleShield(amount: bigint) {
-    setShieldError(null);
+    setApproveError(null);
+    setIsApproving(true);
     try {
       await preApprove(amount);
     } catch (e) {
-      setShieldError(e instanceof Error ? e.message : "Approval failed");
+      setApproveError(e instanceof Error ? e.message : "Approval failed");
       return;
+    } finally {
+      setIsApproving(false);
     }
     shield.mutate({ amount, approvalStrategy: "skip" });
   }
 
+  const isPending = isApproving || shield.isPending;
+
   return (
     <>
-      {shieldError && <p style={{ color: "red" }}>{shieldError}</p>}
-      <button onClick={() => handleShield(100_000_000n)} disabled={shield.isPending}>
-        {shield.isPending ? "Shielding…" : "Shield 100 USDC"}
+      {approveError && <p style={{ color: "red" }}>{approveError}</p>}
+      <button onClick={() => handleShield(100_000_000n)} disabled={isPending}>
+        {isApproving ? "Approving…" : shield.isPending ? "Shielding…" : "Shield 100 USDC"}
       </button>
     </>
   );
@@ -592,6 +595,6 @@ You learned how to:
 - Shield ERC-20 tokens into confidential wrappers
 - Decrypt confidential balances with an EIP-712 session authorization
 - Send confidential transfers
-- Unshield tokens through the two-phase withdrawal flow
+- Unshield tokens back to ERC-20 with automatic resume support
 
 *Contributed by [Zama](https://www.zama.org/)*
