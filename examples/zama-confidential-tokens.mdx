@@ -67,156 +67,7 @@ npm install @turnkey/react-wallet-kit@^1.11.1 @turnkey/viem@^0.14.28 @zama-fhe/s
 
 ## Integration steps
 
-### 1. Implement `TurnkeyViemSigner`
-
-The Zama SDK requires a `GenericSigner` — an object that wraps a signing account and exposes standardized methods for reading/writing contracts and signing EIP-712 typed data.
-
-`ViemSigner` (from `@zama-fhe/sdk/viem`) expects an EIP-1193 `ethereum` provider for wallet lifecycle events, which Turnkey does not expose. The solution is a thin adapter that implements `GenericSigner` directly on top of viem clients backed by a Turnkey account.
-
-Two critical implementation details:
-- Strip `EIP712Domain` from `typedData.types` before calling `walletClient.signTypedData` — viem injects it automatically from the `domain` field and will throw on duplicates.
-- `primaryType` is typed as optional in `GenericSigner`'s `EIP712TypedData` — derive it from the remaining keys as a fallback when not provided.
-
-```tsx
-// src/lib/turnkey-viem-signer.ts
-import type {
-  Account,
-  Abi,
-  ContractFunctionArgs,
-  ContractFunctionName,
-  ContractFunctionReturnType,
-  PublicClient,
-  WalletClient,
-  Address,
-  Hex,
-} from "viem";
-// Used for its type only: satisfies walletClient.writeContract's parameter shape.
-import type { writeContract } from "viem/actions";
-import type {
-  EIP712TypedData,
-  GenericSigner,
-  ReadContractConfig,
-  SignerLifecycleCallbacks,
-  TransactionReceipt,
-  WriteContractConfig,
-} from "@zama-fhe/sdk";
-
-export interface TurnkeyViemSignerConfig {
-  walletClient?: WalletClient;
-  publicClient: PublicClient;
-}
-
-export class TurnkeyViemSigner implements GenericSigner {
-  readonly #walletClient?: WalletClient;
-  readonly #publicClient: PublicClient;
-
-  constructor(config: TurnkeyViemSignerConfig) {
-    this.#walletClient = config.walletClient;
-    this.#publicClient = config.publicClient;
-  }
-
-  #requireWalletClient(): WalletClient {
-    if (!this.#walletClient) {
-      throw new TypeError("No walletClient configured — read-only mode");
-    }
-    return this.#walletClient;
-  }
-
-  #requireWalletAndAccount(): { walletClient: WalletClient; account: Account } {
-    const walletClient = this.#requireWalletClient();
-    if (!walletClient.account) {
-      throw new TypeError("WalletClient has no account");
-    }
-    return { walletClient, account: walletClient.account };
-  }
-
-  async getChainId(): Promise<number> {
-    return this.#publicClient.getChainId();
-  }
-
-  async getAddress(): Promise<Address> {
-    return this.#requireWalletAndAccount().account.address;
-  }
-
-  async signTypedData(typedData: EIP712TypedData): Promise<Hex> {
-    const { walletClient, account } = this.#requireWalletAndAccount();
-
-    // viem re-injects EIP712Domain from the `domain` field — passing it
-    // inside `types` causes a duplicate-type error.
-    const { EIP712Domain: _, ...sigTypes } = typedData.types;
-
-    // primaryType is optional in EIP712TypedData — fall back to the first key
-    // in sigTypes when not provided.
-    const primaryType =
-      typedData.primaryType ?? (Object.keys(sigTypes)[0] as string);
-
-    // Safely coerce only the fields that are known to arrive as numbers from
-    // the Zama SDK worker but must be bigint for viem's uint256 encoding.
-    const message = { ...typedData.message } as Record<string, unknown>;
-    if ("startTimestamp" in message && typeof message.startTimestamp === "number") {
-      message.startTimestamp = BigInt(message.startTimestamp);
-    }
-    if ("durationDays" in message && typeof message.durationDays === "number") {
-      message.durationDays = BigInt(message.durationDays);
-    }
-
-    return walletClient.signTypedData({
-      account,
-      primaryType,
-      types: sigTypes,
-      domain: typedData.domain,
-      message,
-    } as Parameters<typeof walletClient.signTypedData>[0]);
-  }
-
-  async writeContract<
-    const TAbi extends Abi | readonly unknown[],
-    TFunctionName extends ContractFunctionName<TAbi, "nonpayable" | "payable">,
-    const TArgs extends ContractFunctionArgs<
-      TAbi,
-      "nonpayable" | "payable",
-      TFunctionName
-    >,
-  >(config: WriteContractConfig<TAbi, TFunctionName, TArgs>): Promise<Hex> {
-    const { walletClient, account } = this.#requireWalletAndAccount();
-    return walletClient.writeContract({
-      chain: walletClient.chain,
-      account,
-      ...config,
-    } as Parameters<typeof writeContract>[1]);
-  }
-
-  async readContract<
-    const TAbi extends Abi | readonly unknown[],
-    TFunctionName extends ContractFunctionName<TAbi, "pure" | "view">,
-    const TArgs extends ContractFunctionArgs<TAbi, "pure" | "view", TFunctionName>,
-  >(
-    config: ReadContractConfig<TAbi, TFunctionName, TArgs>,
-  ): Promise<
-    ContractFunctionReturnType<TAbi, "pure" | "view", TFunctionName, TArgs>
-  > {
-    return this.#publicClient.readContract(config);
-  }
-
-  async waitForTransactionReceipt(hash: Hex): Promise<TransactionReceipt> {
-    return this.#publicClient.waitForTransactionReceipt({ hash });
-  }
-
-  async getBlockTimestamp(): Promise<bigint> {
-    const block = await this.#publicClient.getBlock();
-    return block.timestamp;
-  }
-
-  subscribe(_callbacks: SignerLifecycleCallbacks): () => void {
-    // Turnkey has no EIP-1193 provider — wallet lifecycle events are not supported.
-    return () => {};
-  }
-}
-```
-
----
-
-### 2. Set up providers
+### 1. Set up providers
 
 #### Chain configuration
 
@@ -272,14 +123,14 @@ export function Providers({ children }: { children: ReactNode }) {
 
 #### Step 2 — Create the Turnkey-backed signer
 
-Inside a child component wrapped by `TurnkeyProvider`, retrieve the wallet account and build a `TurnkeyViemSigner`. Run this inside a `useEffect` that triggers once `httpClient` and `wallets` are available:
+Inside a child component wrapped by `TurnkeyProvider`, retrieve the wallet account and build a `ViemSigner`. Run this inside a `useEffect` that triggers once `httpClient` and `wallets` are available:
 
 ```tsx
 // Inside ZamaLayer — a child of TurnkeyProvider
 import { useTurnkey, ClientState } from "@turnkey/react-wallet-kit";
 import { createAccount } from "@turnkey/viem";
 import { createWalletClient, createPublicClient, http, isAddress } from "viem";
-import { TurnkeyViemSigner } from "@/lib/turnkey-viem-signer";
+import { ViemSigner } from "@zama-fhe/sdk/viem";
 import { viemChain } from "@/lib/chain-config";
 
 const { httpClient, wallets, fetchWalletAccounts, clientState } = useTurnkey();
@@ -312,7 +163,7 @@ async function createTurnkeySigner() {
     transport: http(process.env.NEXT_PUBLIC_RPC_URL),
   });
 
-  return new TurnkeyViemSigner({ walletClient, publicClient });
+  return new ViemSigner({ walletClient, publicClient });
 }
 ```
 
@@ -370,7 +221,7 @@ return (
 
 ---
 
-### 3. Add the relayer proxy API route
+### 2. Add the relayer proxy API route
 
 The Zama relayer may restrict direct browser access (CORS). The example below uses **Next.js App Router** (Next.js 15+). If you use another framework, implement the same same-origin proxy pattern in your backend.
 
@@ -437,7 +288,7 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
 
 ---
 
-### 4. Use the SDK hooks
+### 3. Use the SDK hooks
 
 With providers in place, the Zama React hooks work out of the box. Pass the **wrapper address** (confidential token) as `tokenAddress`.
 
