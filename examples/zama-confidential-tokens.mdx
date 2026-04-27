@@ -5,7 +5,9 @@ sidebarTitle: 'Zama Confidential Tokens integration'
 
 ## Overview
 
-[Zama's Confidential Token standard](https://docs.zama.org/protocol) wraps ERC-20 tokens into privacy-preserving counterparts where balances and transfer amounts are encrypted on-chain. This guide shows how to integrate a **Turnkey-managed wallet** with the Zama SDK so users can:
+This guide shows how to use Turnkey embedded wallets to interact with Zama confidential tokens on Sepolia.
+
+[Zama's Confidential Token standard](https://docs.zama.org/protocol) wraps ERC-20 tokens into privacy-preserving counterparts where balances and transfer amounts are encrypted on-chain. Users can:
 
 - **Shield** — lock ERC-20 tokens into a confidential wrapper
 - **Decrypt balance** — read their encrypted balance with a wallet-signed session key
@@ -22,37 +24,32 @@ Turnkey handles key management and transaction signing. The Zama SDK handles all
 
 | Requirement | Details |
 |---|---|
-| Turnkey account | Organization ID and a passkey-registered user |
-| ETH | Small amount for gas on the target network (~0.05 ETH) |
-| Underlying ERC-20 | Token to shield — on Sepolia, testnet faucet tokens work (see addresses below) |
+| Turnkey account | Turnkey organization, Auth Proxy Config ID, and an enabled auth method such as passkey or email OTP |
+| ETH | Small amount for gas on Sepolia (~0.05 ETH) |
+| Underlying ERC-20 | Token to shield — testnet faucet tokens work (see addresses below) |
 
 The `TurnkeyProvider` includes authentication UI for passkeys, email OTP, and OAuth. See the [Turnkey React docs](https://docs.turnkey.com/sdks/react/landing) for sign-in component setup.
 
-You will also need an RPC endpoint URL for the target network (a free [Alchemy](https://www.alchemy.com/) endpoint works well) and the environment variables listed in step 5.
+### Environment variables
+
+```bash
+# .env.local
+
+NEXT_PUBLIC_TURNKEY_ORG_ID=your-turnkey-organization-id
+NEXT_PUBLIC_TURNKEY_AUTH_PROXY_CONFIG_ID=your-turnkey-auth-proxy-config-id
+
+# Sepolia RPC endpoint. Alchemy/Infura or another Sepolia RPC provider works.
+NEXT_PUBLIC_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
+
+# Optional. Only needed if your relayer endpoint requires an API key.
+# ZAMA_RELAYER_API_KEY=your-zama-relayer-api-key
+```
 
 ### Contract addresses
 
-Zama infrastructure addresses are embedded in the SDK and selected automatically based on `NEXT_PUBLIC_CHAIN` (see step 2). The addresses below are provided for reference — you do not need to pass them manually.
+Zama protocol infrastructure addresses are provided by `SepoliaConfig`, so you do not need to pass ACL, KMS, Input Verifier, or registry addresses manually.
 
-**Sepolia** (`SepoliaConfig`):
-
-| Contract | Address |
-|---|---|
-| ACL | `0xf0Ffdc93b7E186bC2f8CB3dAA75D86d1930A433D` |
-| KMS | `0xbE0E383937d564D7FF0BC3b46c51f0bF8d5C311A` |
-| Input Verifier | `0xBBC1fFCdc7C316aAAd72E807D9b0272BE8F84DA0` |
-| Wrappers Registry | `0x2f0750Bbb0A246059d80e94c454586a7F27a128e` |
-
-**Mainnet** (`MainnetConfig`):
-
-| Contract | Address |
-|---|---|
-| ACL | `0xcA2E8f1F656CD25C01F05d0b243Ab1ecd4a8ffb6` |
-| KMS | `0x77627828a55156b04Ac0DC0eb30467f1a552BB03` |
-| Input Verifier | `0xCe0FC2e05CFff1B719EFF7169f7D80Af770c8EA2` |
-| Wrappers Registry | `0xeb5015fF021DB115aCe010f23F55C2591059bBA0` |
-
-**Sepolia testnet wrapper tokens** (permissionless mint via `mint(address, uint256)`):
+For testing, you can use one of the Sepolia wrapper pairs below (permissionless mint via `mint(address, uint256)`):
 
 | Wrapper | Wrapper address | Underlying ERC-20 | Decimals |
 |---|---|---|---|
@@ -60,8 +57,6 @@ Zama infrastructure addresses are embedded in the SDK and selected automatically
 | cUSDTMock | `0x4E7B06D78965594eB5EF5414c357ca21E1554491` | `0xa7da08fafdc9097cc0e7d4f113a61e31d7e8e9b0` | 6 |
 | cWETHMock | `0x46208622DA27d91db4f0393733C8BA082ed83158` | `0xff54739b16576fa5402f211d0b938469ab9a5f3f` | 18 |
 | cZAMAMock | `0xf2D628d2598aF4eAF94CB76a437Ff86CA78FfbFB` | `0x75355a85c6fb9df5f0c80ff54e8747eee9a0bf57` | 18 |
-
-On mainnet, available wrapper tokens are discovered dynamically from the registry via `useListPairs({ metadata: true })`.
 
 ---
 
@@ -158,18 +153,22 @@ export class TurnkeyViemSigner implements GenericSigner {
     const primaryType =
       typedData.primaryType ?? (Object.keys(sigTypes)[0] as string);
 
+    // Safely coerce only the fields that are known to arrive as numbers from
+    // the Zama SDK worker but must be bigint for viem's uint256 encoding.
+    const message = { ...typedData.message } as Record<string, unknown>;
+    if ("startTimestamp" in message && typeof message.startTimestamp === "number") {
+      message.startTimestamp = BigInt(message.startTimestamp);
+    }
+    if ("durationDays" in message && typeof message.durationDays === "number") {
+      message.durationDays = BigInt(message.durationDays);
+    }
+
     return walletClient.signTypedData({
       account,
       primaryType,
       types: sigTypes,
       domain: typedData.domain,
-      // startTimestamp and durationDays arrive as numbers from the SDK worker
-      // but viem requires bigint for uint256 fields.
-      message: {
-        ...typedData.message,
-        startTimestamp: BigInt(typedData.message.startTimestamp),
-        durationDays: BigInt(typedData.message.durationDays),
-      },
+      message,
     } as Parameters<typeof walletClient.signTypedData>[0]);
   }
 
@@ -224,22 +223,19 @@ export class TurnkeyViemSigner implements GenericSigner {
 
 #### Chain configuration
 
-Extract all network-specific values into a single file. Setting `NEXT_PUBLIC_CHAIN=mainnet` in `.env.local` is then the only change needed to switch networks — contract addresses, relayer URL, and token registry all update automatically via the Zama SDK's `MainnetConfig`.
-
 ```tsx
 // src/lib/chain-config.ts
-import { SepoliaConfig, MainnetConfig } from "@zama-fhe/sdk";
-import { sepolia, mainnet } from "viem/chains";
-import type { Chain } from "viem";
+import { SepoliaConfig } from "@zama-fhe/sdk";
+import { sepolia } from "viem/chains";
 
-const isMainnet = process.env.NEXT_PUBLIC_CHAIN === "mainnet";
+export const zamaConfig = SepoliaConfig;
+export const viemChain = sepolia;
 
-export const zamaConfig = isMainnet ? MainnetConfig : SepoliaConfig;
-export const viemChain: Chain = isMainnet ? mainnet : sepolia;
-
-// Gates testnet-only UI (e.g. permissionless token minting).
-export const isTestnet = !isMainnet;
+// Sepolia testnet-only helper.
+export const isTestnet = true;
 ```
+
+The snippets below are focused extracts. In a real app, keep `signer` and `relayer` in component state and initialize them inside `useEffect` after the Turnkey session is ready.
 
 #### Step 1 — Wrap the app
 
@@ -251,13 +247,19 @@ Set up top-level providers. `TurnkeyProvider` handles wallet authentication; `Qu
 import { type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TurnkeyProvider } from "@turnkey/react-wallet-kit";
+import "@turnkey/react-wallet-kit/styles.css";
 
 const queryClient = new QueryClient();
 
 export function Providers({ children }: { children: ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>
-      <TurnkeyProvider config={{ organizationId: process.env.NEXT_PUBLIC_TURNKEY_ORG_ID! }}>
+      <TurnkeyProvider
+        config={{
+          organizationId: process.env.NEXT_PUBLIC_TURNKEY_ORG_ID!,
+          authProxyConfigId: process.env.NEXT_PUBLIC_TURNKEY_AUTH_PROXY_CONFIG_ID!,
+        }}
+      >
         {children}
       </TurnkeyProvider>
     </QueryClientProvider>
@@ -273,33 +275,42 @@ Inside a child component wrapped by `TurnkeyProvider`, retrieve the wallet accou
 // Inside ZamaLayer — a child of TurnkeyProvider
 import { useTurnkey } from "@turnkey/react-wallet-kit";
 import { createAccount } from "@turnkey/viem";
-import { createWalletClient, createPublicClient, http } from "viem";
+import { createWalletClient, createPublicClient, http, isAddress } from "viem";
 import { TurnkeyViemSigner } from "@/lib/turnkey-viem-signer";
 import { viemChain } from "@/lib/chain-config";
 
-const { httpClient, wallets } = useTurnkey();
+const { httpClient, wallets, fetchWalletAccounts } = useTurnkey();
 
-// Select the embedded Ethereum wallet account exposed by Turnkey.
-const embeddedWallet = wallets.find((w) => w.source === "embedded");
-const ethAccount = embeddedWallet?.accounts.find(
-  (a) => a.curve === "CURVE_SECP256K1" && a.addressFormat === "ADDRESS_FORMAT_ETHEREUM",
-);
-const { address, organizationId } = ethAccount!;
+async function createTurnkeySigner() {
+  if (!httpClient || wallets.length === 0) return null;
 
-createAccount({ client: httpClient!, organizationId, signWith: address, ethereumAddress: address })
-  .then((account) => {
-    const walletClient = createWalletClient({
-      account,
-      chain: viemChain,
-      transport: http(process.env.NEXT_PUBLIC_RPC_URL),
-    });
-    const publicClient = createPublicClient({
-      chain: viemChain,
-      transport: http(process.env.NEXT_PUBLIC_RPC_URL),
-    });
-    setSigner(new TurnkeyViemSigner({ walletClient, publicClient }));
-  })
-  .catch(console.error);
+  const accounts = await fetchWalletAccounts({ wallet: wallets[0] });
+  const ethAccount = accounts.find((account) => isAddress(account.address));
+
+  if (!ethAccount) {
+    throw new Error("No Ethereum account found in the selected Turnkey wallet");
+  }
+
+  const account = await createAccount({
+    client: httpClient,
+    organizationId: ethAccount.organizationId,
+    signWith: ethAccount.address,
+    ethereumAddress: ethAccount.address,
+  });
+
+  const walletClient = createWalletClient({
+    account,
+    chain: viemChain,
+    transport: http(process.env.NEXT_PUBLIC_RPC_URL),
+  });
+
+  const publicClient = createPublicClient({
+    chain: viemChain,
+    transport: http(process.env.NEXT_PUBLIC_RPC_URL),
+  });
+
+  return new TurnkeyViemSigner({ walletClient, publicClient });
+}
 ```
 
 #### Step 3 — Initialize Zama
@@ -358,7 +369,7 @@ return (
 
 ### 3. Add the relayer proxy API route
 
-The Zama relayer may restrict direct browser access (CORS). A Next.js catch-all route forwards all SDK requests to the upstream relayer and injects the API key server-side.
+The Zama relayer may restrict direct browser access (CORS). The example below uses **Next.js App Router** (Next.js 15+). If you use another framework, implement the same same-origin proxy pattern in your backend.
 
 ```tsx
 // src/app/api/relayer/[...path]/route.ts
@@ -366,11 +377,9 @@ import { NextRequest } from "next/server";
 
 export const dynamic = "force-dynamic";
 
-const RELAYER_BASE =
-  process.env.NEXT_PUBLIC_CHAIN === "mainnet"
-    ? "https://relayer.mainnet.zama.org/v2"
-    : "https://relayer.testnet.zama.org/v2";
+const RELAYER_BASE = "https://relayer.testnet.zama.org/v2";
 
+// params is a Promise in Next.js 15+
 type RouteContext = { params: Promise<{ path: string[] }> };
 
 async function proxy(request: NextRequest, path: string[]): Promise<Response> {
@@ -434,7 +443,7 @@ With providers in place, the Zama React hooks work out of the box. Pass the **wr
 
 #### Discover available token pairs
 
-Use `useListPairs` to fetch the on-chain wrapper registry. This is the recommended way to build a token selector on both Sepolia and mainnet:
+Use `useListPairs` to fetch the on-chain wrapper registry. This is the recommended way to build a token selector:
 
 ```tsx
 import { useListPairs } from "@zama-fhe/react-sdk";
@@ -595,29 +604,34 @@ Wrap `<ConfidentialBalance>` with `<AuthGuard>` to automatically prompt re-autho
 #### Confidential transfer
 
 ```tsx
+import { useState } from "react";
 import { useConfidentialTransfer } from "@zama-fhe/react-sdk";
-import type { Address } from "viem";
+import { isAddress, type Address } from "viem";
 
-function TransferPanel({
-  wrapperAddress,
-}: {
-  wrapperAddress: Address;
-}) {
+function TransferPanel({ wrapperAddress }: { wrapperAddress: Address }) {
   const transfer = useConfidentialTransfer({ tokenAddress: wrapperAddress });
+  const [recipient, setRecipient] = useState("");
 
-  function handleTransfer(to: Address, amount: bigint) {
-    transfer.mutate({ to, amount });
+  function handleTransfer(amount: bigint) {
+    if (!isAddress(recipient)) {
+      throw new Error("Enter a valid Ethereum recipient address");
+    }
+    transfer.mutate({ to: recipient, amount });
   }
 
   return (
     <>
+      <input
+        value={recipient}
+        onChange={(event) => setRecipient(event.target.value)}
+        placeholder="0x..."
+      />
       {transfer.error && <p style={{ color: "red" }}>{transfer.error.message}</p>}
-      {/* Replace with the actual recipient address. */}
       <button
-        onClick={() => handleTransfer("0xRecipient…" as Address, 50_000_000n)}
-        disabled={transfer.isPending}
+        onClick={() => handleTransfer(50_000_000n)}
+        disabled={transfer.isPending || !isAddress(recipient)}
       >
-        {transfer.isPending ? "Sending…" : "Transfer 50 USDC (confidential)"}
+        {transfer.isPending ? "Sending…" : "Transfer 50 USDC confidentially"}
       </button>
     </>
   );
@@ -716,44 +730,17 @@ function UnshieldPanel({
 
 ---
 
-### 5. Environment variables
-
-```bash
-# .env.local
-
-# "sepolia" (default) or "mainnet" — one variable switches all Zama contract
-# addresses, relayer URL, and token registry automatically.
-NEXT_PUBLIC_CHAIN=sepolia
-
-NEXT_PUBLIC_TURNKEY_ORG_ID=your-turnkey-organization-id
-
-# Recommended: Alchemy free tier. If unset, falls back to the public node
-# bundled in the Zama SDK config for the selected chain.
-# Sepolia:  https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
-# Mainnet:  https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
-NEXT_PUBLIC_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
-
-# Not required on Sepolia testnet. Required on mainnet — request access from Zama.
-# ZAMA_RELAYER_API_KEY=your-zama-relayer-api-key
-```
-
----
-
 ## Summary
 
-- **`TurnkeyViemSigner`** — adapts a Turnkey-backed viem `WalletClient` to the Zama `GenericSigner` interface; handles EIP-712 typed data signing and contract interactions
-- **`TurnkeyProvider` + `useTurnkey()`** — provides authenticated Turnkey context and the wallet account list
-- **`createAccount()`** — binds the Turnkey-managed key to a viem `Account` for use with viem clients
-- **`ZamaProvider`** — initializes the FHE runtime, relayer connection, and session key storage
-- **`/api/relayer` proxy** — forwards SDK requests to the Zama relayer with server-side API key injection and automatic network switching
-- **`useListPairs`** — discovers available confidential token pairs from the on-chain registry
-- **`useShield` + `preApprove`** — shields ERC-20 tokens with a receipt-confirmed approval before calling the SDK
-- **`useConfidentialBalance`** — decrypts the on-chain encrypted balance using a user-signed session key
-- **`useIsAllowed` + `useAllow`** — checks and refreshes session key authorization for balance decryption
-- **`useConfidentialTransfer`** — sends tokens without revealing the amount on-chain
-- **`useUnshield` / `useResumeUnshield`** — two-phase withdrawal with persistence across page reloads
-- Tested on Sepolia testnet with `@zama-fhe/sdk` v3.0.0 and `@turnkey/react-wallet-kit` v1.11.1.
-- The `preApprove` workaround may become unnecessary in a future Zama SDK release.
-- The `primaryType` fallback may be resolved in a future Zama SDK release.
-- The relayer proxy assumes Next.js App Router. Adjust for Pages Router or other frameworks as needed.
-- The relayer proxy catches network failures and returns a `502` — add logging in production to surface upstream relayer errors.
+You learned how to:
+
+- Authenticate users with `@turnkey/react-wallet-kit`
+- Create a Turnkey-backed viem account with `@turnkey/viem`
+- Adapt that account to the Zama SDK through `GenericSigner`
+- Initialize the Zama React SDK and relayer on Sepolia
+- Shield ERC-20 tokens into confidential wrappers
+- Decrypt confidential balances with an EIP-712 session authorization
+- Send confidential transfers
+- Unshield tokens through the two-phase withdrawal flow
+
+*Contributed by [Zama](https://www.zama.ai/)*
