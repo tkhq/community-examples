@@ -480,7 +480,7 @@ function TransferPanel({ wrapperAddress }: { wrapperAddress: Address }) {
 
 #### Unshield (confidential → ERC-20)
 
-Unshield is a **two-phase** operation and is not immediate. Phase 1 submits the on-chain unwrap request; phase 2 waits for the KMS to decrypt the ciphertext and finalize the withdrawal — tokens remain locked until phase 2 completes. If the user closes the app between phases, the pending unwrap hash is persisted and can be resumed.
+`useUnshield` handles the full withdrawal automatically — submit, wait for KMS decryption, finalize — in a single `mutate()` call. The process can take several minutes. If the user closes the app before it completes, the phase 1 tx hash is persisted so the flow can be resumed with `useResumeUnshield`.
 
 ```tsx
 import { useEffect } from "react";
