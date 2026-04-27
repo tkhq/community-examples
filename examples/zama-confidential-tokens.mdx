@@ -312,7 +312,7 @@ function TokenSelector({ onSelect }: { onSelect: (address: Address) => void }) {
 
 #### Shield (ERC-20 → confidential)
 
-Some RPC nodes simulate transactions against the committed chain state. When `approve` and `wrap` land in the same block, the wrap may revert because the node sees no approved allowance yet. The fix is to perform the approval yourself with a confirmed receipt, then pass `approvalStrategy: "skip"` so the SDK skips its internal approval step.
+The SDK's internal approval step (`#ensureAllowance`) submits the `approve` transaction but does **not** await its receipt before immediately submitting the `wrap` transaction. RPC providers that simulate transactions against the committed chain state (Alchemy, Infura) see allowance = 0 at simulation time and revert the wrap. The fix is to perform the approval yourself with a confirmed receipt, then pass `approvalStrategy: "skip"` so the SDK skips its own approval step.
 
 ```tsx
 import { useState } from "react";
