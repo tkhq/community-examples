@@ -150,6 +150,10 @@ const {
   signTransaction: turnkeySignTransaction,
 } = useTurnkey();
 
+function ensureHexPrefix(value: string): `0x${string}` {
+  return (value.startsWith("0x") ? value : `0x${value}`) as `0x${string}`;
+}
+
 async function createTurnkeySigner() {
   if (clientState !== ClientState.Ready || wallets.length === 0) return null;
 
@@ -189,17 +193,15 @@ async function createTurnkeySigner() {
       return serializeSignature(signature, "hex");
     },
     async signTransaction(transaction, options) {
-      const unsignedTransaction = await (options?.serializer?.(transaction) ??
-        serializeTransaction(transaction));
+      const serializer = options?.serializer ?? serializeTransaction;
+      const unsignedTransaction = (await serializer(transaction)).replace(/^0x/, "");
       const signedTransaction = await turnkeySignTransaction({
-        unsignedTransaction: String(unsignedTransaction).replace(/^0x/, ""),
+        unsignedTransaction,
         transactionType: "TRANSACTION_TYPE_ETHEREUM",
         walletAccount: ethAccount,
         organizationId: ethAccount.organizationId,
       });
-      return signedTransaction.startsWith("0x")
-        ? signedTransaction
-        : `0x${signedTransaction}`;
+      return ensureHexPrefix(signedTransaction);
     },
     async signTypedData(typedData) {
       const signature = await turnkeySignMessage({
