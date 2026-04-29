@@ -28,7 +28,7 @@ Turnkey handles key management and transaction signing. The Zama SDK handles all
 | ETH | Small amount for gas on Sepolia (~0.05 ETH) |
 | Underlying ERC-20 | Token to shield — testnet faucet tokens work (see addresses below) |
 
-The `TurnkeyProvider` includes authentication UI for passkeys, email OTP, and OAuth. See the [Turnkey React docs](https://docs.turnkey.com/sdks/react/landing) for sign-in component setup.
+The `TurnkeyProvider` includes authentication UI for passkeys, email OTP, and OAuth. For the fastest path to a working auth setup, start from the [Turnkey Quickstart](https://docs.turnkey.com/getting-started/quickstart).
 
 ### Environment variables
 
@@ -261,15 +261,8 @@ async function proxy(request: NextRequest, path: string[]): Promise<Response> {
 export async function GET(request: NextRequest, context: RouteContext) {
   return proxy(request, (await context.params).path);
 }
-export async function POST(request: NextRequest, context: RouteContext) {
-  return proxy(request, (await context.params).path);
-}
-export async function PUT(request: NextRequest, context: RouteContext) {
-  return proxy(request, (await context.params).path);
-}
-export async function DELETE(request: NextRequest, context: RouteContext) {
-  return proxy(request, (await context.params).path);
-}
+
+// Repeat the same pattern for POST / PUT / DELETE if your relayer integration needs them.
 ```
 
 ---
@@ -596,5 +589,7 @@ You learned how to:
 - Decrypt confidential balances with an EIP-712 session authorization
 - Send confidential transfers
 - Unshield tokens back to ERC-20 with automatic resume support
+
+---
 
 *Contributed by [Zama](https://www.zama.org/)*
