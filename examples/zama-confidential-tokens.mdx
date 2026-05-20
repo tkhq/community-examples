@@ -269,11 +269,13 @@ const config = useMemo(() => {
   });
 }, [walletClient, publicClient]);
 
+// children render unwrapped pre-config so sign-in UI keeps working;
+// gate any Zama-using component on `config` being non-null in your page tree.
 if (!config) return <>{children}</>;
 return <ZamaProvider config={config}>{children}</ZamaProvider>;
 ```
 
-> ⚠️ **Gating Zama-using children.** `ZamaProvider` mounts asynchronously, after `createTurnkeyClients()` resolves. Until then, the snippet above renders children **without** `ZamaProvider`. Any component calling a Zama hook (`useShield`, `useConfidentialBalance`, `useListPairs`, …) during that window throws `"useZamaSDK must be used within a <ZamaProvider>"`. Expose a readiness signal (a custom context, or a returned boolean) from your providers component and gate Zama-using components on it in your page tree. The pre-auth UI (sign-in button, etc.) can keep rendering as-is — only Zama-using children need the gate.
+The pre-auth UI (sign-in) can live anywhere; only components calling Zama hooks (`useShield`, `useConfidentialBalance`, …) need to wait for `config`.
 
 ---
 
