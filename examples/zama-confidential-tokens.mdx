@@ -62,7 +62,7 @@ For testing, you can use one of the Sepolia wrapper pairs below (permissionless 
 ## Install dependencies
 
 ```bash
-npm install @turnkey/react-wallet-kit@^1.11.1 @turnkey/viem@^0.14.28 @zama-fhe/sdk@^3.0.0 @zama-fhe/react-sdk@^3.0.0 viem @tanstack/react-query
+npm install @turnkey/react-wallet-kit@^1.11.1 @turnkey/viem@^0.14.28 @zama-fhe/sdk@^3.0.0-alpha.41 @zama-fhe/react-sdk@^3.0.0-alpha.41 viem @tanstack/react-query
 ```
 
 ---
@@ -120,9 +120,9 @@ export function Providers({ children }: { children: ReactNode }) {
 }
 ```
 
-#### Step 2 — Create the Turnkey-backed signer
+#### Step 2 — Build viem clients backed by Turnkey
 
-Inside a child component wrapped by `TurnkeyProvider`, retrieve the embedded wallet account and build a `ViemSigner`. Run this inside a `useEffect` that triggers once the Turnkey session is ready:
+Inside a child component wrapped by `TurnkeyProvider`, retrieve the embedded wallet account and build viem `walletClient` + `publicClient`. The Zama SDK is configured directly from these viem clients in Step 3 — there is no need to construct a signer instance manually. Run this inside a `useEffect` that triggers once the Turnkey session is ready:
 
 ```tsx
 // Inside ZamaLayer — a child of TurnkeyProvider
@@ -139,7 +139,6 @@ import {
   serializeTypedData,
 } from "viem";
 import { toAccount } from "viem/accounts";
-import { ViemSigner } from "@zama-fhe/sdk/viem";
 import { viemChain } from "@/lib/chain-config";
 
 const {
@@ -154,7 +153,7 @@ function ensureHexPrefix(value: string): `0x${string}` {
   return (value.startsWith("0x") ? value : `0x${value}`) as `0x${string}`;
 }
 
-async function createTurnkeySigner() {
+async function createTurnkeyClients() {
   if (clientState !== ClientState.Ready || wallets.length === 0) return null;
 
   const embeddedWallet = wallets.find((wallet) => wallet.source === WalletSource.Embedded);
@@ -226,51 +225,51 @@ async function createTurnkeySigner() {
     transport: http(process.env.NEXT_PUBLIC_RPC_URL),
   });
 
-  return new ViemSigner({ walletClient, publicClient });
+  return { walletClient, publicClient };
 }
 ```
 
-If the authenticated session has no embedded wallet yet, create one first in your app flow, then retry the signer initialization.
+If the authenticated session has no embedded wallet yet, create one first in your app flow, then retry the client initialization.
 
 #### Step 3 — Initialize Zama
 
-Initialize the relayer inside a `useEffect` (requires browser environment for `window.location.origin`) and render `ZamaProvider` once `signer` and `relayer` are ready. The relayer URL is proxied through `/api/relayer` to avoid CORS and keep the API key server-side. Two storage instances keep the encrypted keypair and session signatures isolated:
+Build the SDK configuration with `createConfig` and pass it to `ZamaProvider`. The configuration bundles the viem clients from Step 2, the relayer transport, the FHE chain definitions, and storage. The relayer URL is proxied through `/api/relayer` (defined in section 2 below) to avoid CORS and keep the API key server-side. Two storage instances keep the encrypted keypair and permit signatures isolated:
 
 ```tsx
 // src/components/providers.tsx (continued)
-import {
-  ZamaProvider, RelayerWeb, IndexedDBStorage, indexedDBStorage,
-} from "@zama-fhe/react-sdk";
-import { zamaConfig } from "@/lib/chain-config";
+import { useMemo } from "react";
+import { ZamaProvider } from "@zama-fhe/react-sdk";
+import { IndexedDBStorage, indexedDBStorage } from "@zama-fhe/sdk";
+import { createConfig } from "@zama-fhe/sdk/viem";
+import { web } from "@zama-fhe/sdk/web";
+import { sepolia as zamaSepolia } from "@zama-fhe/sdk/chains";
 
-const sessionDBStorage = new IndexedDBStorage("SessionStore");
+const permitDBStorage = new IndexedDBStorage("PermitStore");
 
-// Inside useEffect([]):
-setRelayer(new RelayerWeb({
-  getChainId: async () => zamaConfig.chainId,
-  transports: {
-    [zamaConfig.chainId]: {
-      ...zamaConfig,
-      relayerUrl: `${window.location.origin}/api/relayer`,
-      network: process.env.NEXT_PUBLIC_RPC_URL,
-    },
-  },
-}));
-
-// Render once both relayer and signer are ready:
-return (
-  <ZamaProvider
-    relayer={relayer}
-    signer={signer}
-    storage={indexedDBStorage}
-    sessionStorage={sessionDBStorage}
-    onEvent={(event) => {
+// Inside ZamaLayer — `walletClient` and `publicClient` come from Step 2,
+// available once `createTurnkeyClients()` has resolved.
+const config = useMemo(() => {
+  if (!walletClient || !publicClient || typeof window === "undefined") return null;
+  const fheSepolia = {
+    ...zamaSepolia,
+    network: process.env.NEXT_PUBLIC_RPC_URL!,
+    relayerUrl: `${window.location.origin}/api/relayer`,
+  };
+  return createConfig({
+    chains: [fheSepolia],
+    publicClient,
+    walletClient,
+    storage: indexedDBStorage,
+    permitStorage: permitDBStorage,
+    relayers: { [fheSepolia.id]: web() },
+    onEvent: (event) => {
       window.dispatchEvent(new CustomEvent(event.type, { detail: event }));
-    }}
-  >
-    {children}
-  </ZamaProvider>
-);
+    },
+  });
+}, [walletClient, publicClient]);
+
+if (!config) return <>{children}</>;
+return <ZamaProvider config={config}>{children}</ZamaProvider>;
 ```
 
 ---
@@ -337,7 +336,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
 
 ### 3. Use the SDK hooks
 
-With providers in place, the Zama React hooks work out of the box. Pass the **wrapper address** (confidential token) as `tokenAddress`.
+With providers in place, the Zama React hooks work out of the box. Pass the **wrapper address** (confidential token) as `address` to each hook (the connected account is read from the SDK context).
 
 #### Discover available token pairs
 
@@ -346,7 +345,7 @@ Use `useListPairs` to fetch the on-chain wrapper registry. This is the recommend
 ```tsx
 import { useListPairs } from "@zama-fhe/react-sdk";
 import type { Address } from "viem";
-import type { TokenWrapperPairWithMetadata } from "@zama-fhe/react-sdk";
+import type { TokenWrapperPairWithMetadata } from "@zama-fhe/sdk";
 
 function TokenSelector({ onSelect }: { onSelect: (address: Address) => void }) {
   const { data, isPending } = useListPairs({ metadata: true });
@@ -370,75 +369,48 @@ function TokenSelector({ onSelect }: { onSelect: (address: Address) => void }) {
 
 #### Shield (ERC-20 → confidential)
 
-The SDK's internal approval step (`#ensureAllowance`) submits the `approve` transaction but does **not** await its receipt before immediately submitting the `wrap` transaction. RPC providers that simulate transactions against the committed chain state (Alchemy, Infura) see allowance = 0 at simulation time and revert the wrap. The fix is to perform the approval yourself with a confirmed receipt, then pass `approvalStrategy: "skip"` so the SDK skips its own approval step.
+`useShield`'s built-in approval submits the `approve` transaction but does **not** await its receipt before immediately submitting the `wrap` transaction. RPC providers that simulate transactions against the committed chain state (Alchemy, Infura) see allowance = 0 at simulation time and revert the wrap. The fix is to perform the approval yourself with a confirmed receipt via `useApproveUnderlying`, then pass `approvalStrategy: "skip"` so `useShield` skips its own approval step.
 
 ```tsx
-import { useState } from "react";
-import { useShield, allowanceContract, approveContract, useZamaSDK } from "@zama-fhe/react-sdk";
-import { createPublicClient, http, type Address, type Hex } from "viem";
-import { viemChain } from "@/lib/chain-config";
+import {
+  useShield,
+  useApproveUnderlying,
+  useUnderlyingAllowance,
+} from "@zama-fhe/react-sdk";
+import type { Address } from "viem";
 
 function ShieldPanel({
   wrapperAddress,
-  underlyingAddress,
   ownerAddress,
 }: {
   wrapperAddress: Address;
-  underlyingAddress: Address;
   ownerAddress: Address;
 }) {
-  const { signer } = useZamaSDK();
-  const publicClient = createPublicClient({
-    chain: viemChain,
-    transport: http(process.env.NEXT_PUBLIC_RPC_URL),
+  const { data: allowance } = useUnderlyingAllowance({
+    address: wrapperAddress,
+    owner: ownerAddress,
   });
-  const shield = useShield({ tokenAddress: wrapperAddress });
-  const [isApproving, setIsApproving] = useState(false);
-  const [approveError, setApproveError] = useState<string | null>(null);
-
-  // Perform ERC-20 approval with a confirmed receipt before shielding.
-  async function preApprove(amount: bigint): Promise<void> {
-    const allowance = (await signer.readContract(
-      allowanceContract(underlyingAddress, ownerAddress, wrapperAddress),
-    )) as bigint;
-
-    if (allowance >= amount) return;
-
-    // Reset non-zero allowance first — required by USDT-like tokens.
-    if (allowance > 0n) {
-      const resetHash = await signer.writeContract(
-        approveContract(underlyingAddress, wrapperAddress, 0n),
-      );
-      await publicClient.waitForTransactionReceipt({ hash: resetHash as Hex });
-    }
-
-    const approveHash = await signer.writeContract(
-      approveContract(underlyingAddress, wrapperAddress, amount),
-    );
-    await publicClient.waitForTransactionReceipt({ hash: approveHash as Hex });
-  }
+  const approve = useApproveUnderlying(wrapperAddress);
+  const shield = useShield({ address: wrapperAddress });
 
   async function handleShield(amount: bigint) {
-    setApproveError(null);
-    setIsApproving(true);
-    try {
-      await preApprove(amount);
-    } catch (e) {
-      setApproveError(e instanceof Error ? e.message : "Approval failed");
-      return;
-    } finally {
-      setIsApproving(false);
+    if (allowance === undefined || allowance < amount) {
+      // Reset non-zero allowance first — required by USDT-like tokens.
+      if (allowance && allowance > 0n) {
+        await approve.mutateAsync({ amount: 0n });
+      }
+      await approve.mutateAsync({ amount });
     }
     shield.mutate({ amount, approvalStrategy: "skip" });
   }
 
-  const isPending = isApproving || shield.isPending;
+  const isPending = approve.isPending || shield.isPending;
 
   return (
     <>
-      {approveError && <p style={{ color: "red" }}>{approveError}</p>}
+      {approve.error && <p style={{ color: "red" }}>{approve.error.message}</p>}
       <button onClick={() => handleShield(100_000_000n)} disabled={isPending}>
-        {isApproving ? "Approving…" : shield.isPending ? "Shielding…" : "Shield 100 USDC"}
+        {approve.isPending ? "Approving…" : shield.isPending ? "Shielding…" : "Shield 100 USDC"}
       </button>
     </>
   );
@@ -447,7 +419,7 @@ function ShieldPanel({
 
 #### Decrypt confidential balance
 
-Decrypting a confidential balance triggers an EIP-712 signature request: the user's wallet signs an authorization that allows the Zama relayer to perform the decryption on their behalf. The session key is cached after the first signature and reused until it expires (see [Session key re-authorization](#session-key-re-authorization) below).
+Decrypting a confidential balance triggers an EIP-712 signature request: the user's wallet signs an authorization (a *permit*) that allows the Zama relayer to perform the decryption on their behalf. The permit is cached after the first signature and reused until it expires (see [Permit re-authorization](#permit-re-authorization) below).
 
 ```tsx
 import { useConfidentialBalance } from "@zama-fhe/react-sdk";
@@ -455,15 +427,18 @@ import { formatUnits, type Address } from "viem";
 
 function ConfidentialBalance({
   wrapperAddress,
+  ownerAddress,
   decimals,
   symbol,
 }: {
   wrapperAddress: Address;
+  ownerAddress: Address;
   decimals: number;
   symbol: string;
 }) {
   const { data: balance, isLoading } = useConfidentialBalance({
-    tokenAddress: wrapperAddress,
+    address: wrapperAddress,
+    account: ownerAddress,
   });
 
   if (isLoading) return <span>Decrypting…</span>;
@@ -475,12 +450,12 @@ function ConfidentialBalance({
 }
 ```
 
-#### Session key re-authorization
+#### Permit re-authorization
 
-Balance decryption uses a session key signed by the user's wallet. Sessions expire after a configurable period. Use `useIsAllowed` to check validity and `useAllow` to trigger re-authorization — typically shown as a gate before the balance component:
+Balance decryption uses a *permit* signed by the user's wallet. Permits expire after a configurable period (`permitTTL` on `createConfig`). Use `useHasPermit` to check validity and `useGrantPermit` to trigger re-authorization — typically shown as a gate before the balance component:
 
 ```tsx
-import { useIsAllowed, useAllow } from "@zama-fhe/react-sdk";
+import { useHasPermit, useGrantPermit } from "@zama-fhe/react-sdk";
 import type { Address } from "viem";
 
 function AuthGuard({
@@ -490,16 +465,16 @@ function AuthGuard({
   wrapperAddress: Address;
   children: React.ReactNode;
 }) {
-  const { data: isAllowed } = useIsAllowed({ contractAddresses: [wrapperAddress] });
-  const allow = useAllow();
+  const { data: hasPermit } = useHasPermit({ contractAddresses: [wrapperAddress] });
+  const grantPermit = useGrantPermit();
 
-  if (!isAllowed) {
+  if (!hasPermit) {
     return (
       <button
-        onClick={() => allow.mutate({ contractAddresses: [wrapperAddress] })}
-        disabled={allow.isPending}
+        onClick={() => grantPermit.mutate([wrapperAddress])}
+        disabled={grantPermit.isPending}
       >
-        {allow.isPending ? "Authorizing…" : "Authorize balance decrypt"}
+        {grantPermit.isPending ? "Authorizing…" : "Authorize balance decrypt"}
       </button>
     );
   }
@@ -508,7 +483,7 @@ function AuthGuard({
 }
 ```
 
-Wrap `<ConfidentialBalance>` with `<AuthGuard>` to automatically prompt re-authorization when the session expires.
+Wrap `<ConfidentialBalance>` with `<AuthGuard>` to automatically prompt re-authorization when the permit expires.
 
 #### Confidential transfer
 
@@ -518,7 +493,7 @@ import { useConfidentialTransfer } from "@zama-fhe/react-sdk";
 import { isAddress, type Address } from "viem";
 
 function TransferPanel({ wrapperAddress }: { wrapperAddress: Address }) {
-  const transfer = useConfidentialTransfer({ tokenAddress: wrapperAddress });
+  const transfer = useConfidentialTransfer({ address: wrapperAddress });
   const [recipient, setRecipient] = useState("");
 
   function handleTransfer(amount: bigint) {
@@ -553,14 +528,13 @@ function TransferPanel({ wrapperAddress }: { wrapperAddress: Address }) {
 
 ```tsx
 import { useEffect } from "react";
+import { useUnshield, useResumeUnshield } from "@zama-fhe/react-sdk";
 import {
-  useUnshield,
-  useResumeUnshield,
   clearPendingUnshield,
   savePendingUnshield,
   ZamaSDKEvents,
   indexedDBStorage,
-} from "@zama-fhe/react-sdk";
+} from "@zama-fhe/sdk";
 import type { Hex, Address } from "viem";
 
 function UnshieldPanel({
@@ -572,14 +546,8 @@ function UnshieldPanel({
   pendingTxHash: Hex | null;
   onSuccess: () => void;
 }) {
-  const unshield = useUnshield({
-    tokenAddress: wrapperAddress,
-    wrapperAddress,
-  });
-  const resumeUnshield = useResumeUnshield({
-    tokenAddress: wrapperAddress,
-    wrapperAddress,
-  });
+  const unshield = useUnshield(wrapperAddress);
+  const resumeUnshield = useResumeUnshield(wrapperAddress);
 
   // Persist the unwrap tx hash when phase 1 completes so the flow can be
   // resumed if the user closes the app before phase 2 finalizes.
