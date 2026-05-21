@@ -14,7 +14,7 @@ This guide shows how to use Turnkey embedded wallets to interact with Zama confi
 - **Transfer confidentially** — send tokens without exposing the amount on-chain
 - **Unshield** — convert confidential tokens back to standard ERC-20
 
-Turnkey handles key management and transaction signing. The Zama SDK handles all encryption and on-chain coordination. The integration point is Zama's `GenericSigner` interface, implemented here as a thin adapter over Turnkey-backed viem clients.
+Turnkey handles key management and transaction signing. The Zama SDK handles all encryption and on-chain coordination. The integration point is a viem `Account` whose sign callbacks route to Turnkey: pass the resulting `WalletClient` to `createConfig` from `@zama-fhe/sdk/viem`, and the SDK wraps it as its internal `GenericSigner` transparently.
 
 A full working version of this example is available in the [zama-ai/react-turnkey-wallet repository](https://github.com/zama-ai/sdk/tree/prerelease/examples/react-turnkey-wallet).
 
@@ -437,49 +437,23 @@ function TokenSelector({
 
 #### Shield (ERC-20 → confidential)
 
-`useShield`'s built-in approval submits the `approve` transaction but does **not** await its receipt before immediately submitting the `wrap` transaction. RPC providers that simulate transactions against the committed chain state (Alchemy, Infura) see allowance = 0 at simulation time and revert the wrap. The fix is to perform the approval yourself with a confirmed receipt via `useApproveUnderlying`, then pass `approvalStrategy: "skip"` so `useShield` skips its own approval step.
+`useShield` handles the full shielding flow in a single call: it detects ERC-1363 support on the underlying ERC-20 and routes between the single-tx `transferAndCall` path and the two-tx `approve` + `wrap` path automatically. Existing non-zero allowances (e.g. USDT) are reset to zero before re-approving, so callers don't need to special-case them.
 
 ```tsx
-import {
-  useShield,
-  useApproveUnderlying,
-  useUnderlyingAllowance,
-} from "@zama-fhe/react-sdk";
+import { useShield } from "@zama-fhe/react-sdk";
 import type { Address } from "viem";
 
-function ShieldPanel({
-  wrapperAddress,
-  ownerAddress,
-}: {
-  wrapperAddress: Address;
-  ownerAddress: Address;
-}) {
-  const { data: allowance } = useUnderlyingAllowance({
-    address: wrapperAddress,
-    owner: ownerAddress,
-  });
-  const approve = useApproveUnderlying(wrapperAddress);
+function ShieldPanel({ wrapperAddress }: { wrapperAddress: Address }) {
   const shield = useShield({ address: wrapperAddress });
-
-  async function handleShield(amount: bigint) {
-    if (allowance === undefined || allowance < amount) {
-      // Reset non-zero allowance first — required by USDT-like tokens.
-      if (allowance && allowance > 0n) {
-        await approve.mutateAsync({ amount: 0n });
-      }
-      await approve.mutateAsync({ amount });
-    }
-    shield.mutate({ amount, approvalStrategy: "skip" });
-  }
-
-  const isPending = approve.isPending || shield.isPending;
 
   return (
     <>
-      {approve.error && <p style={{ color: "red" }}>{approve.error.message}</p>}
       {shield.error && <p style={{ color: "red" }}>{shield.error.message}</p>}
-      <button onClick={() => handleShield(100_000_000n)} disabled={isPending}>
-        {approve.isPending ? "Approving…" : shield.isPending ? "Shielding…" : "Shield 100"}
+      <button
+        onClick={() => shield.mutate({ amount: 100_000_000n })}
+        disabled={shield.isPending}
+      >
+        {shield.isPending ? "Shielding…" : "Shield 100"}
       </button>
     </>
   );
@@ -488,7 +462,7 @@ function ShieldPanel({
 
 #### Decrypt confidential balance
 
-Decrypting a confidential balance triggers an EIP-712 signature request: the user's wallet signs an authorization (a *permit*) that allows the Zama relayer to perform the decryption on their behalf. The permit is cached after the first signature and reused until it expires (see [Permit re-authorization](#permit-re-authorization) below).
+Decrypting confidential balances requires a *permit* — an EIP-712 signature that authorizes the Zama relayer to decrypt the user's encrypted handles. The signature is requested once via `useGrantPermit` (see [Permit re-authorization](#permit-re-authorization) below) and the resulting permit is cached, so subsequent balance reads reuse it without prompting the user until it expires.
 
 ```tsx
 import { useConfidentialBalance } from "@zama-fhe/react-sdk";
@@ -738,10 +712,7 @@ export default function Page() {
               symbol={pair.confidential.symbol}
             />
           </AuthGuard>
-          <ShieldPanel
-            wrapperAddress={pair.confidentialTokenAddress}
-            ownerAddress={walletAddress}
-          />
+          <ShieldPanel wrapperAddress={pair.confidentialTokenAddress} />
           <TransferPanel wrapperAddress={pair.confidentialTokenAddress} />
           <UnshieldPanel
             wrapperAddress={pair.confidentialTokenAddress}
