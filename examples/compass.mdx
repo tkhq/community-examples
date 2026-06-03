@@ -5,20 +5,20 @@ sidebarTitle: "Compass integration"
 
 ## Overview
 
-[Compass](https://www.compasslabs.ai/) is a non-custodial DeFi API. Make one call and Compass returns a **ready-to-sign transaction** for whatever you want — earn yield, borrow against collateral, rebalance a portfolio, trade perps — across Aave, Morpho, Pendle, and more. It never holds keys: you fetch the transaction and have **Turnkey** sign and broadcast it under your policy-controlled keys.
+[Compass](https://www.compasslabs.ai/) is a non-custodial DeFi API. Make one call and Compass returns a **ready-to-sign transaction** for whatever you want — earn yield, borrow against collateral, rebalance a portfolio, buy tokenized RWAs, trade perps — across Aave, Morpho, Pendle, Ondo, and more. It never holds keys: you fetch the transaction and have **Turnkey** sign and broadcast it under your policy-controlled keys.
 
 This guide uses USDC on **Base Mainnet** throughout, but the pattern is always the same: **Compass builds, Turnkey signs.**
 
 ## Why Compass instead of direct protocol integrations?
 
-- **One API, many protocols** — earn, borrow, rebalance, and trade across Aave, Morpho/ERC-4626 vaults, Pendle, and more through a single interface.
+- **One API, the whole stack** — everything from **yield → credit → RWAs → perps** through one interface: Aave, Morpho/ERC-4626 vaults, and Pendle for yield; lending markets for credit; Ondo tokenized equities for RWAs; and perpetual futures.
 - **Ready-to-sign transactions** — Compass returns the exact `to`/`data`/`value`. No ABIs, no manual calldata, no juggling approvals.
 - **Atomic bundles** — withdraw → swap → redeposit across venues in a single signed transaction.
 - **Policy-enforced** — a Turnkey policy restricts the signer to only the contracts Compass uses, which suits running from a backend or agent.
 
 ## What you can build with Compass
 
-Every product is reached the same way — call Compass to build the transaction, sign it with Turnkey. This guide codes the Earn, Credit, and Portfolio rows; the rest follow the identical pattern.
+Every product is reached the same way — call Compass to build the transaction, sign it with Turnkey. This guide codes the Earn, Credit, and Portfolio rows below; RWAs and perps use the same build-then-sign approach.
 
 | Product | What it does | Compass call |
 | --- | --- | --- |
@@ -27,8 +27,10 @@ Every product is reached the same way — call Compass to build the transaction,
 | **Earn — Pendle** | Buy fixed-yield Principal Tokens | `earn.earnManage` · venue `PENDLE_PT` |
 | **Portfolio** | Atomic rebalance: withdraw → swap → redeposit | `earn.earnBundle` |
 | **Credit** | Borrow / repay against collateral | `credit.creditBorrow` / `creditRepay` |
-| **Perps** | Trade perpetuals (Hyperliquid) | `traditionalInvesting.*` |
-| **Tokenized assets** | Buy / sell tokenized equities | `tokenizedAssets.*` |
+| **RWAs** | Buy / sell tokenized equities (Ondo) | `tokenizedEquities.*` |
+| **Perps** | Trade perpetual futures | `globalMarketsPerps.*` |
+
+More RWA venues are rolling out behind the same `tokenizedEquities` interface, so new tokenized assets become available without changing your integration.
 
 ## Getting started
 
@@ -181,7 +183,11 @@ const rebalance = await compass.earn.earnBundle({
 await signAndSend(rebalance.transaction);
 ```
 
-Repay with `creditRepay`, read health with `creditPositions`. Compass also covers perps and tokenized equities — see the [Compass API reference](https://docs.compasslabs.ai/).
+Repay with `creditRepay`, read health with `creditPositions`.
+
+<Note>
+  **RWAs and perps sign differently — same idea, different primitive.** Buying tokenized RWAs (Ondo, `tokenizedEquities.*`) or trading perps (`globalMarketsPerps.*`) isn't a single on-chain transaction: Compass returns an off-chain **order**, Turnkey signs it with `signTypedData`, and Compass submits it to settle. *Compass builds, Turnkey signs* still holds — just a signature instead of a broadcast. See the [Compass API reference](https://docs.compasslabs.ai/) for the full quote → order → submit flow.
+</Note>
 
 ## Optional: gasless transactions
 
@@ -214,7 +220,9 @@ compass earn manage \
                   # (the signer + signAndSend helper from above, reading the tx from stdin)
 ```
 
-The Turnkey **policy** limits what this key can sign — only the contracts Compass uses — so an automated job can run the strategy without the key being able to sign arbitrary transactions. See Turnkey's [policy engine](https://docs.turnkey.com/features/policies/overview) for details.
+<Tip>
+  **Built for agents.** The Turnkey **policy** limits what this key can sign — only the contracts Compass uses — so a cron job or AI agent can run the strategy unattended, without the key being able to sign arbitrary transactions. The same agent can allocate across the whole Compass stack — yield, credit, and RWAs — as venues come online. See Turnkey's [policy engine](https://docs.turnkey.com/features/policies/overview) for details.
+</Tip>
 
 ### More use cases
 
@@ -233,6 +241,6 @@ You've now learned how to:
 - Restrict what the wallet can sign with a Turnkey policy
 - Run the same flow unattended from the Compass CLI
 
-Every transaction is built by Compass and signed with Turnkey — no ABIs and no custom contract logic.
+Every transaction is built by Compass and signed with Turnkey — no ABIs and no custom contract logic. The same two calls extend across Compass's full stack — from yield and credit to **RWAs** and **perps**.
 
 *Contributed by [Compass Labs](https://www.compasslabs.ai/)*
