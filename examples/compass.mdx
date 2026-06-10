@@ -1,0 +1,246 @@
+---
+title: 'Use Turnkey wallets with Compass'
+sidebarTitle: "Compass integration"
+---
+
+## Overview
+
+[Compass](https://www.compasslabs.ai/) is a non-custodial DeFi API. Make one call and Compass returns a **ready-to-sign transaction** for whatever you want — earn yield, borrow against collateral, rebalance a portfolio, buy tokenized RWAs, trade perps — across Aave, Morpho, Pendle, Ondo, and more. It never holds keys: you fetch the transaction and have **Turnkey** sign and broadcast it under your policy-controlled keys.
+
+This guide uses USDC on **Base Mainnet** throughout, but the pattern is always the same: **Compass builds, Turnkey signs.**
+
+## Why Compass instead of direct protocol integrations?
+
+- **One API, the whole stack** — everything from **yield → credit → RWAs → perps** through one interface: Aave, Morpho/ERC-4626 vaults, and Pendle for yield; lending markets for credit; Ondo tokenized equities for RWAs; and perpetual futures.
+- **Ready-to-sign transactions** — Compass returns the exact `to`/`data`/`value`. No ABIs, no manual calldata, no juggling approvals.
+- **Atomic bundles** — withdraw → swap → redeposit across venues in a single signed transaction.
+- **Policy-enforced** — a Turnkey policy restricts the signer to only the contracts Compass uses, which suits running from a backend or agent.
+
+## What you can build with Compass
+
+Every product is reached the same way — call Compass to build the transaction, sign it with Turnkey. This guide codes the Earn, Credit, and Portfolio rows below; RWAs and perps use the same build-then-sign approach.
+
+| Product | What it does | Compass call |
+| --- | --- | --- |
+| **Earn — Aave** | Supply to Aave V3 lending markets | `earn.earnManage` · venue `AAVE` |
+| **Earn — Morpho & vaults** | Deposit into Morpho and other ERC-4626 vaults | `earn.earnManage` · venue `VAULT` |
+| **Earn — Pendle** | Buy fixed-yield Principal Tokens | `earn.earnManage` · venue `PENDLE_PT` |
+| **Portfolio** | Atomic rebalance: withdraw → swap → redeposit | `earn.earnBundle` |
+| **Credit** | Borrow / repay against collateral | `credit.creditBorrow` / `creditRepay` |
+| **RWAs** | Buy / sell tokenized equities (Ondo) | `tokenizedEquities.*` |
+| **Perps** | Trade perpetual futures | `globalMarketsPerps.*` |
+
+More RWA venues are rolling out behind the same `tokenizedEquities` interface, so new tokenized assets become available without changing your integration.
+
+## Getting started
+
+Follow the Turnkey [Quickstart](/get-started/quickstart) to set up an **organization ID**, a **root user**, and a **wallet** with an Ethereum account. Then create a **non-root user** with its own API key and [remove it from the root quorum](https://app.turnkey.com/dashboard/security/updateRootQuorum) ([script](https://github.com/tkhq/sdk/blob/main/examples/kitchen-sink/src/sdk-server/updateRootQuorum.ts)) — this is the key the agent signs with. Fund the wallet with a little ETH (for gas) and USDC on Base.
+
+Finally, get a free **Compass API key** from the [Compass dashboard](https://www.compasslabs.ai/dashboard).
+
+## Install dependencies
+
+```bash
+npm install @compass-labs/api-sdk @turnkey/sdk-server @turnkey/viem viem
+```
+
+## Set up the policy for the non-root user
+
+Using the **root** user, create a policy that restricts the non-root signer to only the contracts Compass transactions touch — the USDC token and your Compass account (its address comes from the next step). Everything else is denied by default.
+
+```tsx
+import { Turnkey } from "@turnkey/sdk-server";
+
+const turnkeyClient = new Turnkey({
+  apiBaseUrl: "https://api.turnkey.com",
+  apiPrivateKey: process.env.TURNKEY_API_PRIVATE_KEY!,
+  apiPublicKey: process.env.TURNKEY_API_PUBLIC_KEY!,
+  defaultOrganizationId: process.env.TURNKEY_ORGANIZATION_ID!,
+}).apiClient();
+
+const USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC on Base
+const COMPASS_ACCOUNT_ADDRESS = process.env.COMPASS_ACCOUNT_ADDRESS!;
+
+await turnkeyClient.createPolicy({
+  policyName: "Allow the agent to sign Compass transactions only",
+  effect: "EFFECT_ALLOW",
+  consensus: `approvers.any(user, user.id == '${process.env.NONROOT_USER_ID}')`,
+  condition: `eth.tx.to in ['${USDC_ADDRESS}', '${COMPASS_ACCOUNT_ADDRESS}']`,
+  notes: "",
+});
+```
+
+Widen this allowlist as you add products and venues, or tighten it to specific function selectors with `eth.tx.data[0..10] == '0x...'`.
+
+## Set up the Turnkey signer
+
+We use `@turnkey/viem` to create a signer that plugs into a `viem` wallet client — with the **non-root** user's key (a root user would bypass the policy engine). Then one helper signs and broadcasts whatever Compass returns:
+
+```tsx
+import { base } from "viem/chains";
+import { createAccount } from "@turnkey/viem";
+import { Turnkey as TurnkeyServerSDK } from "@turnkey/sdk-server";
+import { createWalletClient, createPublicClient, http, type Account } from "viem";
+import { CompassApiSDK } from "@compass-labs/api-sdk";
+
+const turnkeyServer = new TurnkeyServerSDK({
+  apiBaseUrl: "https://api.turnkey.com",
+  apiPrivateKey: process.env.NONROOT_API_PRIVATE_KEY!,
+  apiPublicKey: process.env.NONROOT_API_PUBLIC_KEY!,
+  defaultOrganizationId: process.env.TURNKEY_ORGANIZATION_ID!,
+});
+
+const turnkeyAccount = await createAccount({
+  client: turnkeyServer.apiClient(),
+  organizationId: process.env.TURNKEY_ORGANIZATION_ID!,
+  signWith: process.env.SIGN_WITH!, // your Turnkey wallet's Ethereum address (the "owner")
+});
+
+const owner = (turnkeyAccount as Account).address;
+const rpc = `https://base-mainnet.infura.io/v3/${process.env.INFURA_API_KEY!}`;
+const walletClient = createWalletClient({ account: turnkeyAccount as Account, chain: base, transport: http(rpc) });
+const publicClient = createPublicClient({ chain: base, transport: http(rpc) });
+const compass = new CompassApiSDK({ apiKeyAuth: process.env.COMPASS_API_KEY! });
+
+// Compass returns { to, data, value } — Turnkey signs and broadcasts it.
+async function signAndSend(tx: any) {
+  const hash = await walletClient.sendTransaction({
+    to: tx.to, data: tx.data, value: BigInt(tx.value ?? "0"),
+  });
+  await publicClient.waitForTransactionReceipt({ hash });
+  return hash;
+}
+```
+
+## Set up your Compass account
+
+Compass routes positions through a smart account your wallet owns and controls. Create it once (use its address in the policy above), then fund it with USDC from your wallet:
+
+```tsx
+// 1. Create the account (returns a deploy tx only if it doesn't exist yet)
+const account = await compass.earn.earnCreateAccount({ chain: "base", owner, sender: owner, estimateGas: true });
+if (account.transaction) await signAndSend(account.transaction);
+
+// 2. Fund it from your wallet
+const fund = await compass.earn.earnTransfer({ owner, chain: "base", token: "USDC", amount: "100", action: "DEPOSIT" });
+await signAndSend(fund.transaction);
+```
+
+## Deposit into any venue
+
+Here's the payoff: depositing is the **same call for every protocol** — you only change the `venue`. Compass isn't just Aave: the one `earnManage` call covers **Aave** markets, **Morpho** (and other ERC-4626) vaults, and **Pendle** PTs — what would otherwise be three separate integrations.
+
+```tsx
+const deposit = await compass.earn.earnManage({
+  owner, chain: "base",
+  venue: { type: "AAVE", token: "USDC" },
+  action: "DEPOSIT", amount: "100",
+});
+await signAndSend(deposit.transaction);
+```
+
+To use a different venue, swap that one field — discover options with `earn.earnVaults()` / `earn.earnPendleMarkets()`:
+
+```tsx
+venue: { type: "VAULT", vaultAddress: "0xbeeF010f9cb27031ad51e3333f9aF9C6B1228183" }       // Morpho (Steakhouse USDC vault)
+venue: { type: "PENDLE_PT", marketAddress: "0x...", token: "USDC", maxSlippagePercent: 1 } // Pendle
+```
+
+## Check positions and withdraw
+
+Reads need no signing; withdrawing reverses the deposit and funding steps:
+
+```tsx
+// Read positions (balance, PnL, yield earned)
+const positions = await compass.earn.earnPositions({ owner, chain: "base" });
+
+// Withdraw from the venue, then back to your wallet.
+// (amount is a decimal string — to exit fully, read the live balance from earnPositions and pass it.)
+const exit = await compass.earn.earnManage({ owner, chain: "base", venue: { type: "AAVE", token: "USDC" }, action: "WITHDRAW", amount: "100" });
+await signAndSend(exit.transaction);
+const out = await compass.earn.earnTransfer({ owner, chain: "base", token: "USDC", amount: "100", action: "WITHDRAW" });
+await signAndSend(out.transaction);
+```
+
+## Beyond yield: borrow & rebalance
+
+The same build-then-sign loop covers the rest of Compass. Borrow against collateral, or rebalance across venues in one atomic transaction:
+
+```tsx
+// Borrow (Credit has its own one-time account: compass.credit.creditCreateAccount)
+const borrow = await compass.credit.creditBorrow({ owner, chain: "base", borrowToken: "USDC", borrowAmount: "1000" });
+await signAndSend(borrow.transaction);
+
+// Rebalance: exit one vault → swap → enter another, signed once
+const rebalance = await compass.earn.earnBundle({
+  owner, chain: "base",
+  actions: [
+    { body: { actionType: "V2_MANAGE", venue: { type: "VAULT", vaultAddress: "0xVaultA..." }, action: "WITHDRAW", amount: "5000" } },
+    { body: { actionType: "V2_SWAP", tokenIn: "USDC", tokenOut: "WETH", amountIn: "5000", slippage: 0.5 } },
+    { body: { actionType: "V2_MANAGE", venue: { type: "VAULT", vaultAddress: "0xVaultB..." }, action: "DEPOSIT", amount: "2" } }, // amount = WETH received from the swap
+  ],
+});
+await signAndSend(rebalance.transaction);
+```
+
+Repay with `creditRepay`, read health with `creditPositions`.
+
+<Note>
+  **RWAs and perps sign differently — same idea, different primitive.** Buying tokenized RWAs (Ondo, `tokenizedEquities.*`) or trading perps (`globalMarketsPerps.*`) isn't a single on-chain transaction: Compass returns an off-chain **order**, Turnkey signs it with `signTypedData`, and Compass submits it to settle. *Compass builds, Turnkey signs* still holds — just a signature instead of a broadcast. See the [Compass API reference](https://docs.compasslabs.ai/) for the full quote → order → submit flow.
+</Note>
+
+## Optional: gasless transactions
+
+Pass `gasSponsorship: true` to any action and Compass returns EIP-712 typed data (a Safe transaction) instead of a transaction. Turnkey signs it with `turnkeyAccount.signTypedData(...)` — first remapping the SDK's camelCased `types` keys back to their EIP-712 names (`SafeTx`, `EIP712Domain`) — and a sponsor wallet broadcasts it via `compass.gasSponsorship.gasSponsorshipPrepare(...)`, so your wallet never needs ETH.
+
+## Use the Compass CLI
+
+Prefer the command line? The [Compass CLI](https://github.com/CompassLabs/cli) builds the exact same transactions from your shell — handy for scripts, cron jobs, and quick checks. The JSON output is the same unsigned transaction, which you sign with Turnkey just like above.
+
+```bash
+compass earn manage \
+  --venue '{"type":"AAVE","token":"USDC"}' \
+  --action DEPOSIT --amount 100 \
+  --owner $SIGN_WITH --chain base -o json
+```
+
+### Use case: an autonomous yield agent
+
+Because Compass builds the transaction and Turnkey signs it under policy, the two combine into a hands-off **autonomous agent** — whether that's a scheduled cron job or an AI agent deciding when and how much to deposit. No human in the loop. For example, a job that sweeps idle USDC into Aave on a schedule:
+
+```bash
+#!/usr/bin/env bash
+# yield-agent.sh — runs unattended on a schedule
+
+compass earn manage \
+  --venue '{"type":"AAVE","token":"USDC"}' \
+  --action DEPOSIT --amount 100 \
+  --owner "$SIGN_WITH" --chain base -o json \
+| node sign.mjs   # signs + broadcasts with your Turnkey wallet
+                  # (the signer + signAndSend helper from above, reading the tx from stdin)
+```
+
+<Tip>
+  **Built for agents.** The Turnkey **policy** limits what this key can sign — only the contracts Compass uses — so a cron job or AI agent can run the strategy unattended, without the key being able to sign arbitrary transactions. The same agent can allocate across the whole Compass stack — yield, credit, and RWAs — as venues come online. See Turnkey's [policy engine](https://docs.turnkey.com/features/policies/overview) for details.
+</Tip>
+
+### More use cases
+
+The same pattern — a Compass read or build command, optionally piped into your Turnkey signer — covers plenty of other jobs:
+
+- **Credit health guardian.** Watch a borrow position and repay before it gets risky. Read `compass credit positions --chain base --owner $SIGN_WITH` (returns each position plus an account summary with health factor and LTV); if the health factor drops below your threshold, run `compass credit repay --owner $SIGN_WITH --chain base --repay-token USDC --repay-amount 100 -o json | node sign.mjs`.
+- **Best-yield rebalancer.** On a schedule, rotate into the highest-APY vault. Find it with `compass earn vaults --chain base --asset-symbol USDC --order-by apy --direction desc --limit 1 --jq '.vaults[0].vault_address'`, then move funds atomically with `compass earn bundle … -o json | node sign.mjs`.
+- **Monitoring & alerts.** Reads never touch the wallet — pipe positions straight into dashboards or alerting: `compass earn positions --chain base --owner $SIGN_WITH -o json | jq '.'`. No policy or signature involved.
+
+## Summary
+
+You've now learned how to:
+
+- Build DeFi transactions with Compass across **Aave**, **Morpho**, and **Pendle**, plus borrowing and atomic rebalancing
+- Sign and broadcast them with a Turnkey wallet using `@turnkey/viem`
+- Restrict what the wallet can sign with a Turnkey policy
+- Run the same flow unattended from the Compass CLI
+
+Every transaction is built by Compass and signed with Turnkey — no ABIs and no custom contract logic. The same two calls extend across Compass's full stack — from yield and credit to **RWAs** and **perps**.
+
+*Contributed by [Compass Labs](https://www.compasslabs.ai/)*

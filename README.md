@@ -51,6 +51,7 @@ This repo is a submodule of the [tkhq/docs](https://github.com/tkhq/docs) reposi
 | Example | Description | Contributor |
 |---------|-------------|-------------|
 | [YO Protocol](./examples/yo-protocol.mdx) | Deposit and redeem from ERC-4626 yield vaults using Turnkey wallets | YO Protocol |
+| [Compass](./examples/compass.mdx) | Build DeFi transactions across yield, credit, RWAs, and perps — Aave, Morpho, Pendle, Ondo and more — with the Compass API, signed by Turnkey wallets | Compass Labs |
 
 ---
 
