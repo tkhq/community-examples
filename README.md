@@ -52,6 +52,7 @@ This repo is a submodule of the [tkhq/docs](https://github.com/tkhq/docs) reposi
 |---------|-------------|-------------|
 | [YO Protocol](./examples/yo-protocol.mdx) | Deposit and redeem from ERC-4626 yield vaults using Turnkey wallets | YO Protocol |
 | [Zama Confidential Tokens](./examples/zama-confidential-tokens.mdx) | Shield, transfer, and unshield ERC-20 tokens with on-chain FHE encryption using Turnkey wallets | Zama |
+| [Compass](./examples/compass.mdx) | Build DeFi transactions across yield, credit, RWAs, and perps — Aave, Morpho, Pendle, Ondo and more — with the Compass API, signed by Turnkey wallets | Compass Labs |
 
 ---
 
