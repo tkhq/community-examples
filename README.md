@@ -12,7 +12,7 @@ A community-maintained collection of integration guides showing how to use [Turn
 - **Uses Turnkey meaningfully** - The Turnkey integration is clear alongside your own product
 - **Includes working code** - Code snippets should be accurate and generally working. Make sure any additional packages/dependencies are made clear for your example.
 
-Follow the conventions established in the [Turnkey Cookbook](https://docs.turnkey.com/cookbook) as a guide for structure, depth, and quality when writing your example.
+Follow the conventions established in the [Turnkey Cookbook](https://docs.turnkey.com/solutions/cookbooks/) as a guide for structure, depth, and quality when writing your example.
 
 ### Pull Request Template
 
