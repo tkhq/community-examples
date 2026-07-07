@@ -1,0 +1,746 @@
+---
+title: 'Use Turnkey wallets with Zama Confidential Tokens'
+sidebarTitle: 'Zama Confidential Tokens integration'
+---
+
+## Overview
+
+This guide shows how to use Turnkey embedded wallets to interact with Zama confidential tokens on Sepolia.
+
+[Zama's Confidential Token standard](https://docs.zama.org/protocol) wraps ERC-20 tokens into privacy-preserving counterparts where balances and transfer amounts are encrypted on-chain. Users can:
+
+- **Shield** — lock ERC-20 tokens into a confidential wrapper
+- **Decrypt balance** — read their encrypted balance with a wallet-signed permit
+- **Transfer confidentially** — send tokens without exposing the amount on-chain
+- **Unshield** — convert confidential tokens back to standard ERC-20
+
+Turnkey handles key management and transaction signing. The Zama SDK handles all encryption and on-chain coordination. The integration point is a viem `Account` whose sign callbacks route to Turnkey: pass the resulting `WalletClient` to `createConfig` from `@zama-fhe/sdk/viem`, and the SDK wraps it as its internal `GenericSigner` transparently.
+
+A full working version of this example is available in the [zama-ai/react-turnkey-wallet repository](https://github.com/zama-ai/sdk/tree/prerelease/examples/react-turnkey-wallet).
+
+---
+
+## Getting started
+
+### Prerequisites
+
+| Requirement | Details |
+|---|---|
+| Turnkey account | Turnkey organization, Auth Proxy Config ID, and an enabled auth method such as passkey or email OTP |
+| ETH | Small amount for gas on Sepolia (~0.05 ETH) |
+| Underlying ERC-20 | Token to shield — testnet faucet tokens work (see addresses below) |
+| TypeScript `target` | `ES2020` or later — the snippets below use BigInt literals (e.g. `100_000_000n`). Fresh Next.js scaffolds default to `ES2017`; bump `tsconfig.json` if needed. |
+
+The `TurnkeyProvider` includes authentication UI for passkeys, email OTP, and OAuth. For the fastest path to a working auth setup, start from the [Turnkey Quickstart](https://docs.turnkey.com/getting-started/quickstart).
+
+### Environment variables
+
+```bash
+# .env.local
+
+NEXT_PUBLIC_TURNKEY_ORG_ID=your-turnkey-organization-id
+NEXT_PUBLIC_TURNKEY_AUTH_PROXY_CONFIG_ID=your-turnkey-auth-proxy-config-id
+
+# Sepolia RPC endpoint. Alchemy/Infura or another Sepolia RPC provider works.
+NEXT_PUBLIC_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
+```
+
+### Contract addresses
+
+Zama protocol infrastructure addresses are provided by `SepoliaConfig`, so you do not need to pass ACL, KMS, Input Verifier, or registry addresses manually.
+
+For testing, you can use one of the Sepolia wrapper pairs below (permissionless mint via `mint(address, uint256)`). Verify these addresses against the [latest Zama Sepolia deployment](https://docs.zama.org/protocol) before going to production:
+
+| Wrapper | Wrapper address | Underlying ERC-20 | Decimals |
+|---|---|---|---|
+| cUSDCMock | `0x7c5BF43B851c1dff1a4feE8dB225b87f2C223639` | `0x9b5cd13b8efbb58dc25a05cf411d8056058adfff` | 6 |
+| cUSDTMock | `0x4E7B06D78965594eB5EF5414c357ca21E1554491` | `0xa7da08fafdc9097cc0e7d4f113a61e31d7e8e9b0` | 6 |
+| cWETHMock | `0x46208622DA27d91db4f0393733C8BA082ed83158` | `0xff54739b16576fa5402f211d0b938469ab9a5f3f` | 18 |
+| cZAMAMock | `0xf2D628d2598aF4eAF94CB76a437Ff86CA78FfbFB` | `0x75355a85c6fb9df5f0c80ff54e8747eee9a0bf57` | 18 |
+
+---
+
+## Install dependencies
+
+```bash
+npm install @turnkey/react-wallet-kit@^1.11.1 @turnkey/viem@^0.14.28 @zama-fhe/sdk@^3.2.0 @zama-fhe/react-sdk@^3.2.0 viem @tanstack/react-query
+```
+
+---
+
+## Integration steps
+
+### 1. Set up providers
+
+#### Chain configuration
+
+```tsx
+// src/lib/chain-config.ts
+import { sepolia } from "viem/chains";
+
+export const viemChain = sepolia;
+```
+
+#### Root layout
+
+Import the Wallet Kit stylesheet in your root layout (a Server Component), not in the client providers file, and mount the `<Providers>` component defined below:
+
+```tsx
+// src/app/layout.tsx
+import "@turnkey/react-wallet-kit/styles.css";
+import { Providers } from "@/components/providers";
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body>
+        <Providers>{children}</Providers>
+      </body>
+    </html>
+  );
+}
+```
+
+#### Providers component
+
+A single file wires the three layers: Turnkey auth (`TurnkeyProvider`), Turnkey-backed viem clients (built inside `ZamaLayer` once the session resolves), and the Zama SDK (`ZamaProvider` configured from those clients). `useTurnkeySession` exposes the authenticated wallet address plus a readiness signal so pages can gate Zama-using components until `ZamaProvider` is mounted.
+
+```tsx
+// src/components/providers.tsx
+"use client";
+
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  TurnkeyProvider,
+  useTurnkey,
+  ClientState,
+} from "@turnkey/react-wallet-kit";
+import { WalletSource } from "@turnkey/core";
+import { serializeSignature } from "@turnkey/viem";
+import {
+  createWalletClient,
+  createPublicClient,
+  http,
+  isAddress,
+  hashMessage,
+  serializeTransaction,
+  serializeTypedData,
+  type Address,
+  type PublicClient,
+  type WalletClient,
+} from "viem";
+import { toAccount } from "viem/accounts";
+import { ZamaProvider } from "@zama-fhe/react-sdk";
+import { IndexedDBStorage, indexedDBStorage } from "@zama-fhe/sdk";
+import { createConfig } from "@zama-fhe/sdk/viem";
+import { web } from "@zama-fhe/sdk/web";
+import { sepolia as zamaSepolia } from "@zama-fhe/sdk/chains";
+import { viemChain } from "@/lib/chain-config";
+
+const queryClient = new QueryClient();
+const permitDBStorage = new IndexedDBStorage("PermitStore");
+
+// Session context — exposes the connected wallet address + a `isReady` flag
+// that flips true only once `ZamaProvider` is actually mounted with usable
+// viem clients. Pages call `useTurnkeySession()` to gate hooks like
+// `useShield` / `useConfidentialBalance`, which throw if rendered before
+// `ZamaProvider`.
+type Session = { walletAddress: Address | null; isReady: boolean };
+const SessionContext = createContext<Session>({ walletAddress: null, isReady: false });
+export function useTurnkeySession() {
+  return useContext(SessionContext);
+}
+
+export function Providers({ children }: { children: ReactNode }) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <TurnkeyProvider
+        config={{
+          organizationId: process.env.NEXT_PUBLIC_TURNKEY_ORG_ID!,
+          authProxyConfigId: process.env.NEXT_PUBLIC_TURNKEY_AUTH_PROXY_CONFIG_ID!,
+        }}
+      >
+        <ZamaLayer>{children}</ZamaLayer>
+      </TurnkeyProvider>
+    </QueryClientProvider>
+  );
+}
+
+function ensureHexPrefix(value: string): `0x${string}` {
+  return (value.startsWith("0x") ? value : `0x${value}`) as `0x${string}`;
+}
+
+function ZamaLayer({ children }: { children: ReactNode }) {
+  const {
+    wallets,
+    fetchWalletAccounts,
+    clientState,
+    signMessage: turnkeySignMessage,
+    signTransaction: turnkeySignTransaction,
+  } = useTurnkey();
+
+  const [walletClient, setWalletClient] = useState<WalletClient | null>(null);
+  const [publicClient, setPublicClient] = useState<PublicClient | null>(null);
+  const [walletAddress, setWalletAddress] = useState<Address | null>(null);
+
+  // Build the Turnkey-backed viem clients once the auth session is ready.
+  // The viem `Account` returned by `toAccount` routes every sign callback
+  // (`sign`, `signMessage`, `signTransaction`, `signTypedData`) to Turnkey
+  // with the right encoding + hashing policy. `serializeSignature(..., "hex")`
+  // returns a viem union; cast to `0x${string}` so it satisfies
+  // `toAccount`'s sign return type under strict TS.
+  useEffect(() => {
+    let cancelled = false;
+    async function build() {
+      if (clientState !== ClientState.Ready || wallets.length === 0) return;
+
+      const embeddedWallet = wallets.find((w) => w.source === WalletSource.Embedded);
+      if (!embeddedWallet) {
+        // No embedded wallet yet — create one with `useTurnkey().createWallet({...})`
+        // elsewhere in your app flow, then this effect re-runs.
+        return;
+      }
+
+      const accounts = await fetchWalletAccounts({ wallet: embeddedWallet });
+      const ethAccount = accounts.find(
+        (a) => a.source === WalletSource.Embedded && isAddress(a.address),
+      );
+      if (!ethAccount) throw new Error("No embedded Ethereum account in the Turnkey wallet");
+
+      const account = toAccount({
+        address: ethAccount.address as `0x${string}`,
+        async sign({ hash }) {
+          const sig = await turnkeySignMessage({
+            message: hash,
+            walletAccount: ethAccount,
+            encoding: "PAYLOAD_ENCODING_HEXADECIMAL",
+            hashFunction: "HASH_FUNCTION_NO_OP",
+            organizationId: ethAccount.organizationId,
+          });
+          return serializeSignature(sig, "hex") as `0x${string}`;
+        },
+        async signMessage({ message }) {
+          const sig = await turnkeySignMessage({
+            message: hashMessage(message),
+            walletAccount: ethAccount,
+            encoding: "PAYLOAD_ENCODING_HEXADECIMAL",
+            hashFunction: "HASH_FUNCTION_NO_OP",
+            organizationId: ethAccount.organizationId,
+          });
+          return serializeSignature(sig, "hex") as `0x${string}`;
+        },
+        async signTransaction(transaction, options) {
+          const serializer = options?.serializer ?? serializeTransaction;
+          const unsigned = (await serializer(transaction)).replace(/^0x/, "");
+          const signed = await turnkeySignTransaction({
+            unsignedTransaction: unsigned,
+            transactionType: "TRANSACTION_TYPE_ETHEREUM",
+            walletAccount: ethAccount,
+            organizationId: ethAccount.organizationId,
+          });
+          return ensureHexPrefix(signed);
+        },
+        async signTypedData(typedData) {
+          const sig = await turnkeySignMessage({
+            message: serializeTypedData(typedData),
+            walletAccount: ethAccount,
+            encoding: "PAYLOAD_ENCODING_EIP712",
+            hashFunction: "HASH_FUNCTION_NO_OP",
+            organizationId: ethAccount.organizationId,
+          });
+          return serializeSignature(sig, "hex") as `0x${string}`;
+        },
+      });
+
+      const next = {
+        walletClient: createWalletClient({
+          account,
+          chain: viemChain,
+          transport: http(process.env.NEXT_PUBLIC_RPC_URL),
+        }) as WalletClient,
+        publicClient: createPublicClient({
+          chain: viemChain,
+          transport: http(process.env.NEXT_PUBLIC_RPC_URL),
+        }),
+        address: ethAccount.address as Address,
+      };
+      if (cancelled) return;
+      setWalletClient(next.walletClient);
+      setPublicClient(next.publicClient);
+      setWalletAddress(next.address);
+    }
+    build().catch((e) => console.error("Turnkey client build failed:", e));
+    return () => {
+      cancelled = true;
+    };
+  }, [clientState, wallets, fetchWalletAccounts, turnkeySignMessage, turnkeySignTransaction]);
+
+  // Build the Zama SDK config once the viem clients exist. The relayer URL
+  // is proxied through `/api/relayer` (defined in section 2 below) to avoid
+  // CORS and keep any future API key server-side. `permitStorage` is a
+  // separate IndexedDB instance so permit signatures don't overwrite the
+  // FHE keypair (which lives in `storage`). `onEvent` rebroadcasts every SDK
+  // event as a `window` CustomEvent — `UnshieldPanel` (section 3) relies on
+  // this to persist the phase 1 tx hash for the resume flow.
+  const config = useMemo(() => {
+    if (!walletClient || !publicClient || typeof window === "undefined") return null;
+    const fheSepolia = {
+      ...zamaSepolia,
+      network: process.env.NEXT_PUBLIC_RPC_URL!,
+      relayerUrl: `${window.location.origin}/api/relayer`,
+    };
+    return createConfig({
+      chains: [fheSepolia],
+      publicClient,
+      walletClient,
+      storage: indexedDBStorage,
+      permitStorage: permitDBStorage,
+      relayers: { [fheSepolia.id]: web() },
+      onEvent: (event) => {
+        window.dispatchEvent(new CustomEvent(event.type, { detail: event }));
+      },
+    });
+  }, [walletClient, publicClient]);
+
+  const session: Session = { walletAddress, isReady: !!config };
+
+  // children render unwrapped pre-config so the sign-in UI keeps working;
+  // pages gate Zama-using components on `useTurnkeySession().isReady`.
+  return (
+    <SessionContext.Provider value={session}>
+      {config ? <ZamaProvider config={config}>{children}</ZamaProvider> : children}
+    </SessionContext.Provider>
+  );
+}
+```
+
+---
+
+### 2. Add the relayer proxy API route
+
+The Zama relayer may restrict direct browser access (CORS). The example below uses **Next.js App Router** (Next.js 15+). If you use another framework, implement the same same-origin proxy pattern in your backend.
+
+```tsx
+// src/app/api/relayer/[...path]/route.ts
+import { NextRequest } from "next/server";
+
+export const dynamic = "force-dynamic";
+
+const RELAYER_BASE = "https://relayer.testnet.zama.org/v2";
+
+// params is a Promise in Next.js 15+
+type RouteContext = { params: Promise<{ path: string[] }> };
+
+async function proxy(request: NextRequest, path: string[]): Promise<Response> {
+  const target = new URL(`${RELAYER_BASE}/${path.join("/")}`);
+  request.nextUrl.searchParams.forEach((value, key) => {
+    target.searchParams.set(key, value);
+  });
+
+  const headers: Record<string, string> = {
+    "Content-Type": request.headers.get("Content-Type") ?? "application/json",
+  };
+
+  const body =
+    request.method !== "GET" && request.method !== "HEAD"
+      ? await request.text()
+      : undefined;
+
+  let upstream: globalThis.Response;
+  try {
+    upstream = await fetch(target.toString(), {
+      method: request.method,
+      headers,
+      body,
+    });
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "Upstream unreachable";
+    return Response.json({ error: message }, { status: 502 });
+  }
+
+  return new Response(await upstream.text(), {
+    status: upstream.status,
+    headers: {
+      "Content-Type":
+        upstream.headers.get("Content-Type") ?? "application/json",
+    },
+  });
+}
+
+async function handler(request: NextRequest, context: RouteContext) {
+  return proxy(request, (await context.params).path);
+}
+
+// The relayer uses POST for FHE input proofs and decrypt requests, and GET
+// for polling the result endpoints — export all four methods from a single
+// handler so the route covers every call shape the SDK issues.
+export { handler as GET, handler as POST, handler as PUT, handler as DELETE };
+```
+
+---
+
+### 3. Use the SDK hooks
+
+With providers in place, the Zama React hooks work out of the box. Pass the **wrapper address** (confidential token) as `address` to each hook (the connected account is read from the SDK context).
+
+#### Discover available token pairs
+
+Use `useListPairs` to fetch the on-chain wrapper registry. This is the recommended way to build a token selector:
+
+```tsx
+import { useListPairs } from "@zama-fhe/react-sdk";
+import type { TokenWrapperPairWithMetadata } from "@zama-fhe/sdk";
+
+// Passes the full pair (not just the address) so the page can route
+// `decimals` and `symbol` into the panels below without re-querying the
+// registry.
+function TokenSelector({
+  onSelect,
+}: {
+  onSelect: (pair: TokenWrapperPairWithMetadata) => void;
+}) {
+  const { data, isPending } = useListPairs({ metadata: true });
+  const pairs = (data?.items ?? []).filter(
+    (p): p is TokenWrapperPairWithMetadata => p.isValid && "underlying" in p,
+  );
+
+  if (isPending) return <span>Loading tokens…</span>;
+
+  return (
+    <select
+      onChange={(e) => {
+        const pair = pairs.find((p) => p.confidentialTokenAddress === e.target.value);
+        if (pair) onSelect(pair);
+      }}
+      defaultValue=""
+    >
+      <option value="" disabled>
+        Select a token…
+      </option>
+      {pairs.map((p) => (
+        <option key={p.confidentialTokenAddress} value={p.confidentialTokenAddress}>
+          {p.confidential.symbol} (wraps {p.underlying.symbol})
+        </option>
+      ))}
+    </select>
+  );
+}
+```
+
+#### Shield (ERC-20 → confidential)
+
+`useShield` handles the full shielding flow in a single call: it detects ERC-1363 support on the underlying ERC-20 and routes between the single-tx `transferAndCall` path and the two-tx `approve` + `wrap` path automatically. Existing non-zero allowances (e.g. USDT) are reset to zero before re-approving, so callers don't need to special-case them.
+
+```tsx
+import { useShield } from "@zama-fhe/react-sdk";
+import type { Address } from "viem";
+
+function ShieldPanel({ wrapperAddress }: { wrapperAddress: Address }) {
+  const shield = useShield({ address: wrapperAddress });
+
+  return (
+    <>
+      {shield.error && <p style={{ color: "red" }}>{shield.error.message}</p>}
+      <button
+        onClick={() => shield.mutate({ amount: 100_000_000n })}
+        disabled={shield.isPending}
+      >
+        {shield.isPending ? "Shielding…" : "Shield 100"}
+      </button>
+    </>
+  );
+}
+```
+
+#### Decrypt confidential balance
+
+Decrypting confidential balances requires a *permit* — an EIP-712 signature that authorizes the Zama relayer to decrypt the user's encrypted handles. The signature is requested once via `useGrantPermit` (see [Permit re-authorization](#permit-re-authorization) below) and the resulting permit is cached, so subsequent balance reads reuse it without prompting the user until it expires.
+
+```tsx
+import { useConfidentialBalance } from "@zama-fhe/react-sdk";
+import { formatUnits, type Address } from "viem";
+
+function ConfidentialBalance({
+  wrapperAddress,
+  ownerAddress,
+  decimals,
+  symbol,
+}: {
+  wrapperAddress: Address;
+  ownerAddress: Address;
+  decimals: number;
+  symbol: string;
+}) {
+  const { data: balance, isLoading } = useConfidentialBalance({
+    address: wrapperAddress,
+    account: ownerAddress,
+  });
+
+  if (isLoading) return <span>Decrypting…</span>;
+  return (
+    <span>
+      {balance !== undefined ? formatUnits(balance, decimals) : "—"} {symbol}
+    </span>
+  );
+}
+```
+
+#### Permit re-authorization
+
+Balance decryption uses a *permit* signed by the user's wallet. Permits expire after a configurable period (`permitTTL` on `createConfig`). Use `useHasPermit` to check validity and `useGrantPermit` to trigger re-authorization — typically shown as a gate before the balance component:
+
+```tsx
+import { useHasPermit, useGrantPermit } from "@zama-fhe/react-sdk";
+import type { Address } from "viem";
+
+function AuthGuard({
+  wrapperAddress,
+  children,
+}: {
+  wrapperAddress: Address;
+  children: React.ReactNode;
+}) {
+  const { data: hasPermit } = useHasPermit({ contractAddresses: [wrapperAddress] });
+  const grantPermit = useGrantPermit();
+
+  if (!hasPermit) {
+    return (
+      <button
+        onClick={() => grantPermit.mutate([wrapperAddress])}
+        disabled={grantPermit.isPending}
+      >
+        {grantPermit.isPending ? "Authorizing…" : "Authorize balance decrypt"}
+      </button>
+    );
+  }
+
+  return <>{children}</>;
+}
+```
+
+Wrap `<ConfidentialBalance>` with `<AuthGuard>` to automatically prompt re-authorization when the permit expires.
+
+#### Confidential transfer
+
+```tsx
+import { useState } from "react";
+import { useConfidentialTransfer } from "@zama-fhe/react-sdk";
+import { isAddress, type Address } from "viem";
+
+function TransferPanel({ wrapperAddress }: { wrapperAddress: Address }) {
+  const transfer = useConfidentialTransfer({ address: wrapperAddress });
+  const [recipient, setRecipient] = useState("");
+
+  function handleTransfer(amount: bigint) {
+    if (!isAddress(recipient)) {
+      throw new Error("Enter a valid Ethereum recipient address");
+    }
+    transfer.mutate({ to: recipient, amount });
+  }
+
+  return (
+    <>
+      <input
+        value={recipient}
+        onChange={(event) => setRecipient(event.target.value)}
+        placeholder="0x..."
+      />
+      {transfer.error && <p style={{ color: "red" }}>{transfer.error.message}</p>}
+      <button
+        onClick={() => handleTransfer(50_000_000n)}
+        disabled={transfer.isPending || !isAddress(recipient)}
+      >
+        {transfer.isPending ? "Sending…" : "Transfer 50 confidentially"}
+      </button>
+    </>
+  );
+}
+```
+
+#### Unshield (confidential → ERC-20)
+
+`useUnshield` handles the full withdrawal automatically — submit, wait for KMS decryption, finalize — in a single `mutate()` call. The process can take several minutes. If the user closes the app before it completes, the phase 1 tx hash is persisted so the flow can be resumed with `useResumeUnshield`.
+
+```tsx
+import { useEffect } from "react";
+import { useUnshield, useResumeUnshield } from "@zama-fhe/react-sdk";
+import {
+  clearPendingUnshield,
+  savePendingUnshield,
+  ZamaSDKEvents,
+  indexedDBStorage,
+} from "@zama-fhe/sdk";
+import type { Hex, Address } from "viem";
+
+function UnshieldPanel({
+  wrapperAddress,
+  pendingTxHash,
+  onSuccess,
+}: {
+  wrapperAddress: Address;
+  pendingTxHash: Hex | null;
+  onSuccess: () => void;
+}) {
+  const unshield = useUnshield(wrapperAddress);
+  const resumeUnshield = useResumeUnshield(wrapperAddress);
+
+  // Persist the unwrap tx hash when phase 1 completes so the flow can be
+  // resumed if the user closes the app before phase 2 finalizes.
+  useEffect(() => {
+    function handlePhase1(e: Event) {
+      const txHash = (e as CustomEvent<{ txHash: Hex }>).detail.txHash;
+      savePendingUnshield(indexedDBStorage, wrapperAddress, txHash).catch(console.error);
+    }
+    window.addEventListener(ZamaSDKEvents.UnshieldPhase1Submitted, handlePhase1);
+    return () => window.removeEventListener(ZamaSDKEvents.UnshieldPhase1Submitted, handlePhase1);
+  }, [wrapperAddress]);
+
+  function handleUnshield(amount: bigint) {
+    unshield.mutate(
+      { amount },
+      {
+        onSuccess: () => {
+          clearPendingUnshield(indexedDBStorage, wrapperAddress).catch(
+            console.error,
+          );
+          onSuccess();
+        },
+      },
+    );
+  }
+
+  function handleResume(txHash: Hex) {
+    resumeUnshield.mutate(
+      { unwrapTxHash: txHash },
+      {
+        onSuccess: () => {
+          clearPendingUnshield(indexedDBStorage, wrapperAddress).catch(
+            console.error,
+          );
+          onSuccess();
+        },
+      },
+    );
+  }
+
+  return (
+    <>
+      {(unshield.error ?? resumeUnshield.error) && (
+        <p style={{ color: "red" }}>
+          {(unshield.error ?? resumeUnshield.error)?.message}
+        </p>
+      )}
+      {pendingTxHash && (
+        <button
+          onClick={() => handleResume(pendingTxHash)}
+          disabled={resumeUnshield.isPending}
+        >
+          {resumeUnshield.isPending
+            ? "Resuming…"
+            : "Resume unshield (phase 2)"}
+        </button>
+      )}
+      <button
+        onClick={() => handleUnshield(50_000_000n)}
+        disabled={unshield.isPending}
+      >
+        {unshield.isPending ? "Unshielding…" : "Unshield 50"}
+      </button>
+    </>
+  );
+}
+```
+
+#### Compose into a page
+
+A minimal `page.tsx` ties everything together: trigger the Turnkey sign-in flow when the session is unauthenticated, wait for the providers' readiness signal, then render the panels with the wallet address from context and the token metadata from the selector. `loadPendingUnshield` rehydrates any in-progress unshield so the resume button reappears on reload.
+
+```tsx
+// src/app/page.tsx
+"use client";
+
+import { useEffect, useState } from "react";
+import { useTurnkey, AuthState } from "@turnkey/react-wallet-kit";
+import { loadPendingUnshield, indexedDBStorage } from "@zama-fhe/sdk";
+import type { TokenWrapperPairWithMetadata } from "@zama-fhe/sdk";
+import type { Hex } from "viem";
+import { useTurnkeySession } from "@/components/providers";
+
+export default function Page() {
+  const { authState, handleLogin } = useTurnkey();
+  const { walletAddress, isReady } = useTurnkeySession();
+  const [pair, setPair] = useState<TokenWrapperPairWithMetadata | null>(null);
+  const [pendingTxHash, setPendingTxHash] = useState<Hex | null>(null);
+
+  // Rehydrate any in-progress unshield for the selected wrapper.
+  useEffect(() => {
+    if (!pair) return;
+    loadPendingUnshield(indexedDBStorage, pair.confidentialTokenAddress)
+      .then((hash) => setPendingTxHash(hash))
+      .catch(() => setPendingTxHash(null));
+  }, [pair]);
+
+  if (authState !== AuthState.Authenticated) {
+    return <button onClick={() => handleLogin()}>Sign in with Turnkey</button>;
+  }
+
+  // `isReady` flips true once `ZamaProvider` mounts — before that, hooks like
+  // `useShield` / `useConfidentialBalance` would throw.
+  if (!isReady || !walletAddress) {
+    return <p>Initializing Zama SDK…</p>;
+  }
+
+  return (
+    <main>
+      <p>Wallet: <code>{walletAddress}</code></p>
+      <TokenSelector onSelect={setPair} />
+      {pair && (
+        <>
+          <AuthGuard wrapperAddress={pair.confidentialTokenAddress}>
+            <ConfidentialBalance
+              wrapperAddress={pair.confidentialTokenAddress}
+              ownerAddress={walletAddress}
+              decimals={pair.confidential.decimals}
+              symbol={pair.confidential.symbol}
+            />
+          </AuthGuard>
+          <ShieldPanel wrapperAddress={pair.confidentialTokenAddress} />
+          <TransferPanel wrapperAddress={pair.confidentialTokenAddress} />
+          <UnshieldPanel
+            wrapperAddress={pair.confidentialTokenAddress}
+            pendingTxHash={pendingTxHash}
+            onSuccess={() => setPendingTxHash(null)}
+          />
+        </>
+      )}
+    </main>
+  );
+}
+```
+
+---
+
+## Summary
+
+You learned how to:
+
+- Authenticate users with `@turnkey/react-wallet-kit`
+- Build a Turnkey-backed viem account from the authenticated embedded wallet session
+- Adapt that account to the Zama SDK through `GenericSigner`
+- Initialize the Zama React SDK and relayer on Sepolia
+- Shield ERC-20 tokens into confidential wrappers
+- Decrypt confidential balances with an EIP-712 permit signature
+- Send confidential transfers
+- Unshield tokens back to ERC-20 with automatic resume support
+
+---
+
+*Contributed by [Zama](https://www.zama.org/)*
