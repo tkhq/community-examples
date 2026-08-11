@@ -17,7 +17,7 @@ Follow the [Turnkey Quickstart](https://docs.turnkey.com/getting-started/quickst
 
 - A Turnkey organization, root API user, and Ethereum wallet account.
 - A separate API user removed from the root quorum. This non-root user signs the transactions, so the policy engine evaluates every signing request.
-- The wallet account address in `TURNKEY_SIGN_WITH`, plus a small WETH balance for collateral, USDC for repayment, and ETH for Base gas.
+- The wallet account address in `TURNKEY_SIGN_WITH`, plus a small WETH balance for collateral and ETH for Base gas. The example borrow delivers the 1 USDC used for repayment if it remains in the wallet, so only a small additional USDC amount is needed for accrued interest plus asset/share rounding. If that borrowed USDC is spent, swapped, or transferred, reacquire enough USDC to cover the full current debt. The fixed policy below caps the repayment approval at 2 USDC for this tiny example.
 - A Base RPC endpoint. This guide does not sponsor gas.
 
 The fixed market is the currently listed Base WETH/USDC market with ID `0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda`: USDC loan token, WETH collateral token, oracle `0xFEa2D58cEfCb9fcb597723c6bAE66fFE4193aFE4`, Adaptive Curve IRM `0x46415998764C29aB2a25CbeA6254146D50D22687`, and 86% LLTV. Verify the market and contract addresses against current [Morpho data](https://app.morpho.org/base/market/0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda) and SDK deployment metadata before using funds.
@@ -156,9 +156,9 @@ A Turnkey smart contract interface parses only the transaction sent to its regis
 
 ## Supply collateral and borrow
 
-Initialize `@turnkey/sdk-server` with the **non-root** API user's credentials, create the Turnkey-backed viem account, and extend one Base wallet client with public actions and the Morpho SDK extension. `supportSignature: false` forces classic prerequisite transactions instead of Permit or Permit2 signatures.
+Initialize `@turnkey/sdk-server` with the **non-root** API user's credentials, create the Turnkey-backed viem account, attach viem's nonce manager, and extend one Base wallet client with public actions and the Morpho SDK extension. `supportSignature: false` forces classic prerequisite transactions instead of Permit or Permit2 signatures.
 
-The helper sends every prerequisite sequentially and waits for its receipt before continuing. The SDK returns an exact-amount WETH approval and, when needed, the one-time Morpho authorization before building the atomic supply-and-borrow transaction.
+The helper sends every prerequisite sequentially and waits for a two-confirmation receipt before continuing. The SDK returns an exact-amount WETH approval and, when needed, the one-time Morpho authorization before building the atomic supply-and-borrow transaction.
 
 ```tsx
 import { MarketParams } from "@morpho-org/blue-sdk";
@@ -169,6 +169,7 @@ import {
   createWalletClient,
   formatUnits,
   http,
+  nonceManager,
   parseUnits,
   publicActions,
   type Address,
@@ -189,6 +190,7 @@ const turnkeyAccount = await createAccount({
   organizationId,
   signWith: process.env.TURNKEY_SIGN_WITH!,
 });
+turnkeyAccount.nonceManager = nonceManager;
 
 const client = createWalletClient({
   account: turnkeyAccount,
@@ -225,8 +227,8 @@ async function sendAndConfirm(transaction: {
     data: transaction.data,
     value: transaction.value,
   });
-  await client.waitForTransactionReceipt({ hash });
-  return hash;
+  const receipt = await client.waitForTransactionReceipt({ hash, confirmations: 2 });
+  return receipt;
 }
 
 const before = await market.getPositionData(owner);
@@ -244,9 +246,9 @@ for (const requirement of await openPosition.getRequirements()) {
   await sendAndConfirm(requirement);
 }
 
-await sendAndConfirm(openPosition.buildTx());
+const { blockNumber: openedBlockNumber } = await sendAndConfirm(openPosition.buildTx());
 
-const opened = await market.getPositionData(owner);
+const opened = await market.getPositionData(owner, { blockNumber: openedBlockNumber });
 console.log({
   collateralWeth: formatUnits(opened.collateral, 18),
   debtUsdc: formatUnits(opened.borrowAssets, 6),
@@ -255,7 +257,7 @@ console.log({
 });
 ```
 
-The position read is fetched after confirmation, so it includes current accrued market state rather than reusing the pre-transaction object.
+The post-transaction position read is pinned to the confirmed receipt block, so it reflects the final open-position transaction rather than a lagging latest-block response or the pre-transaction object.
 
 ---
 
@@ -283,15 +285,17 @@ for (const requirement of await closePosition.getRequirements()) {
   await sendAndConfirm(requirement);
 }
 
-await sendAndConfirm(closePosition.buildTx());
+const { blockNumber: closedBlockNumber } = await sendAndConfirm(closePosition.buildTx());
 
-const closed = await market.getPositionData(owner);
+const closed = await market.getPositionData(owner, { blockNumber: closedBlockNumber });
 console.log({
   collateralWeth: formatUnits(closed.collateral, 18),
   debtUsdc: formatUnits(closed.borrowAssets, 6),
   borrowShares: closed.borrowShares.toString(),
 });
 ```
+
+The final position read is likewise pinned to the confirmed close-position receipt block.
 
 ---
 
