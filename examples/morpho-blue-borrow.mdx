@@ -1,0 +1,320 @@
+---
+title: 'Use Turnkey wallets with Morpho Blue'
+sidebarTitle: "Morpho Blue integration"
+---
+
+## Overview
+
+[Morpho Blue](https://docs.morpho.org/learn/concepts/morpho/) is a permissionless lending protocol with isolated markets. This guide uses a policy-controlled, non-root **Turnkey** account to supply WETH collateral and borrow USDC from one listed Morpho Blue market on Base. It then reads the position, fully repays by borrow shares, and withdraws the collateral.
+
+The example uses real mainnet contracts. **Use a dedicated test wallet, tiny amounts, and funds you can afford to lose. Borrowing creates liquidation risk, transaction fees apply, and neither an LLTV buffer nor a previously healthy position is universally safe. Never use a raw wallet private key or mnemonic in this flow.**
+
+---
+
+## Getting started
+
+Follow the [Turnkey Quickstart](https://docs.turnkey.com/getting-started/quickstart) and prepare:
+
+- A Turnkey organization, root API user, and Ethereum wallet account.
+- A separate API user removed from the root quorum. This non-root user signs the transactions, so the policy engine evaluates every signing request.
+- The wallet account address in `TURNKEY_SIGN_WITH`, plus a small WETH balance for collateral and ETH for Base gas. The example borrow delivers the 1 USDC used for repayment if it remains in the wallet, so only a small additional USDC amount is needed for accrued interest plus asset/share rounding. If that borrowed USDC is spent, swapped, or transferred, reacquire enough USDC to cover the full current debt. The fixed policy below caps the repayment approval at 2 USDC for this tiny example.
+- A Base RPC endpoint. This guide does not sponsor gas.
+
+The fixed market is the currently listed Base WETH/USDC market with ID `0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda`: USDC loan token, WETH collateral token, oracle `0xFEa2D58cEfCb9fcb597723c6bAE66fFE4193aFE4`, Adaptive Curve IRM `0x46415998764C29aB2a25CbeA6254146D50D22687`, and 86% LLTV. Verify the market and contract addresses against current [Morpho data](https://app.morpho.org/base/market/0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda) and SDK deployment metadata before using funds.
+
+```bash
+TURNKEY_API_BASE_URL=https://api.turnkey.com
+TURNKEY_ORGANIZATION_ID=
+TURNKEY_ROOT_API_PUBLIC_KEY=
+TURNKEY_ROOT_API_PRIVATE_KEY=
+TURNKEY_NONROOT_API_PUBLIC_KEY=
+TURNKEY_NONROOT_API_PRIVATE_KEY=
+TURNKEY_NONROOT_USER_ID=
+TURNKEY_SIGN_WITH=
+BASE_RPC_URL=
+```
+
+---
+
+## Install dependencies
+
+These versions were used to compile and validate the snippets:
+
+```bash
+npm install @morpho-org/blue-sdk@6.4.0 @morpho-org/morpho-sdk@5.4.1 @turnkey/sdk-server@7.0.0 @turnkey/viem@0.14.32 viem@2.55.10
+```
+
+---
+
+## Create a policy with the root client
+
+The SDK currently builds three kinds of top-level transactions for this flow: token approvals sent to WETH or USDC, a one-time authorization sent to Morpho Blue, and combined actions sent to Bundler3. The addresses below come from the Base deployment registry exposed by `getChainAddresses(8453)` and were also checked against the SDK's built transaction output.
+
+Run this one-time setup with the **root** API client. It uploads minimal interfaces so Turnkey can parse the named top-level calls, then creates narrowly scoped policies for the non-root user. The example caps the WETH approval at the supplied collateral and the USDC approval at 2 USDC. Adjust the latter deliberately if accrued debt can exceed that amount.
+
+```tsx
+import { Turnkey } from "@turnkey/sdk-server";
+import { parseUnits } from "viem";
+
+const organizationId = process.env.TURNKEY_ORGANIZATION_ID!;
+const nonRootUserId = process.env.TURNKEY_NONROOT_USER_ID!;
+
+const WETH = "0x4200000000000000000000000000000000000006";
+const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const MORPHO = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb";
+const BUNDLER3 = "0x6BFd8137e702540E7A42B74178A4a49Ba43920C4";
+const GENERAL_ADAPTER1 = "0xb98c948CFA24072e58935BC004a8A7b376AE746A";
+const COLLATERAL_AMOUNT = parseUnits("0.001", 18);
+const MAX_REPAY_APPROVAL = parseUnits("2", 6);
+
+const rootClient = new Turnkey({
+  apiBaseUrl: process.env.TURNKEY_API_BASE_URL!,
+  apiPublicKey: process.env.TURNKEY_ROOT_API_PUBLIC_KEY!,
+  apiPrivateKey: process.env.TURNKEY_ROOT_API_PRIVATE_KEY!,
+  defaultOrganizationId: organizationId,
+}).apiClient();
+
+const erc20ApprovalAbi = [{
+  type: "function",
+  name: "approve",
+  stateMutability: "nonpayable",
+  inputs: [
+    { name: "spender", type: "address" },
+    { name: "value", type: "uint256" },
+  ],
+  outputs: [{ name: "", type: "bool" }],
+}] as const;
+
+const morphoAuthorizationAbi = [{
+  type: "function",
+  name: "setAuthorization",
+  stateMutability: "nonpayable",
+  inputs: [
+    { name: "authorized", type: "address" },
+    { name: "newIsAuthorized", type: "bool" },
+  ],
+  outputs: [],
+}] as const;
+
+const bundler3Abi = [{
+  type: "function",
+  name: "multicall",
+  stateMutability: "payable",
+  inputs: [{ name: "data", type: "bytes[]" }],
+  outputs: [],
+}] as const;
+
+for (const item of [
+  { address: WETH, label: "Base WETH approve", abi: erc20ApprovalAbi },
+  { address: USDC, label: "Base USDC approve", abi: erc20ApprovalAbi },
+  { address: MORPHO, label: "Base Morpho authorization", abi: morphoAuthorizationAbi },
+  { address: BUNDLER3, label: "Base Morpho Bundler3", abi: bundler3Abi },
+] as const) {
+  await rootClient.createSmartContractInterface({
+    smartContractAddress: item.address,
+    smartContractInterface: JSON.stringify(item.abi),
+    type: "SMART_CONTRACT_INTERFACE_TYPE_ETHEREUM",
+    label: item.label,
+    notes: "Interface for the Morpho Blue borrow example",
+  });
+}
+
+const consensus = `approvers.any(user, user.id == '${nonRootUserId}')`;
+const policies = [
+  {
+    policyName: "Allow bounded WETH approval for Morpho",
+    condition: `eth.tx.to == '${WETH}' && eth.tx.function_signature == '0x095ea7b3' && eth.tx.contract_call_args['spender'] == '${GENERAL_ADAPTER1}' && eth.tx.contract_call_args['value'] <= ${COLLATERAL_AMOUNT}`,
+  },
+  {
+    policyName: "Allow bounded USDC approval for Morpho repayment",
+    condition: `eth.tx.to == '${USDC}' && eth.tx.function_signature == '0x095ea7b3' && eth.tx.contract_call_args['spender'] == '${GENERAL_ADAPTER1}' && eth.tx.contract_call_args['value'] <= ${MAX_REPAY_APPROVAL}`,
+  },
+  {
+    policyName: "Allow Morpho adapter authorization",
+    condition: `eth.tx.to == '${MORPHO}' && eth.tx.function_signature == '0xeecea000' && eth.tx.contract_call_args['authorized'] == '${GENERAL_ADAPTER1}' && eth.tx.contract_call_args['newIsAuthorized'] == true`,
+  },
+  {
+    policyName: "Allow Morpho Bundler3 multicalls",
+    condition: `eth.tx.to == '${BUNDLER3}' && eth.tx.function_signature == '0x374f435d'`,
+  },
+] as const;
+
+for (const policy of policies) {
+  await rootClient.createPolicy({
+    policyName: policy.policyName,
+    condition: policy.condition,
+    effect: "EFFECT_ALLOW",
+    consensus,
+    notes: "Non-root Morpho Blue signing policy",
+  });
+}
+```
+
+A Turnkey smart contract interface parses only the transaction sent to its registered address. The Bundler3 policy above verifies the top-level target and `multicall` selector; it does **not** claim to enforce every nested call encoded inside the `bytes[]`. Test the exact SDK output you intend to sign, inspect `to`, `value`, and decoded calldata, and add controls outside this example if your threat model requires nested-call enforcement. Re-check deployment metadata whenever dependencies change.
+
+---
+
+## Supply collateral and borrow
+
+Initialize `@turnkey/sdk-server` with the **non-root** API user's credentials, create the Turnkey-backed viem account, attach viem's nonce manager, and extend one Base wallet client with public actions and the Morpho SDK extension. `supportSignature: false` forces classic prerequisite transactions instead of Permit or Permit2 signatures.
+
+The helper sends every prerequisite sequentially and waits for a two-confirmation receipt before continuing. The SDK returns an exact-amount WETH approval and, when needed, the one-time Morpho authorization before building the atomic supply-and-borrow transaction.
+
+```tsx
+import { MarketParams } from "@morpho-org/blue-sdk";
+import { morphoViemExtension } from "@morpho-org/morpho-sdk";
+import { Turnkey } from "@turnkey/sdk-server";
+import { createAccount } from "@turnkey/viem";
+import {
+  createWalletClient,
+  formatUnits,
+  http,
+  nonceManager,
+  parseUnits,
+  publicActions,
+  type Address,
+  type Hex,
+} from "viem";
+import { base } from "viem/chains";
+
+const organizationId = process.env.TURNKEY_ORGANIZATION_ID!;
+const turnkeyServer = new Turnkey({
+  apiBaseUrl: process.env.TURNKEY_API_BASE_URL!,
+  apiPublicKey: process.env.TURNKEY_NONROOT_API_PUBLIC_KEY!,
+  apiPrivateKey: process.env.TURNKEY_NONROOT_API_PRIVATE_KEY!,
+  defaultOrganizationId: organizationId,
+});
+
+const turnkeyAccount = await createAccount({
+  client: turnkeyServer.apiClient(),
+  organizationId,
+  signWith: process.env.TURNKEY_SIGN_WITH!,
+});
+turnkeyAccount.nonceManager = nonceManager;
+
+const client = createWalletClient({
+  account: turnkeyAccount,
+  chain: base,
+  transport: http(process.env.BASE_RPC_URL!),
+})
+  .extend(publicActions)
+  .extend(morphoViemExtension({ supportSignature: false }));
+
+const marketParams = new MarketParams({
+  loanToken: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  collateralToken: "0x4200000000000000000000000000000000000006",
+  oracle: "0xFEa2D58cEfCb9fcb597723c6bAE66fFE4193aFE4",
+  irm: "0x46415998764C29aB2a25CbeA6254146D50D22687",
+  lltv: 860000000000000000n,
+});
+
+if (base.id !== 8453) throw new Error("Expected Base chain ID 8453");
+if (marketParams.id.toLowerCase() !== "0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda") {
+  throw new Error("Market parameters do not match the expected market ID");
+}
+
+const market = client.morpho.blue(marketParams, base.id);
+const owner = turnkeyAccount.address;
+
+async function sendAndConfirm(transaction: {
+  readonly to: Address;
+  readonly data: Hex;
+  readonly value: bigint;
+}) {
+  const hash = await client.sendTransaction({
+    account: turnkeyAccount,
+    to: transaction.to,
+    data: transaction.data,
+    value: transaction.value,
+  });
+  const receipt = await client.waitForTransactionReceipt({ hash, confirmations: 2 });
+  return receipt;
+}
+
+const before = await market.getPositionData(owner);
+const openPosition = market.supplyCollateralBorrow({
+  amount: parseUnits("0.001", 18),
+  borrowAmount: parseUnits("1", 6),
+  userAddress: owner,
+  positionData: before,
+});
+
+for (const requirement of await openPosition.getRequirements()) {
+  if ("sign" in requirement) {
+    throw new Error("Unexpected signature requirement with supportSignature disabled");
+  }
+  await sendAndConfirm(requirement);
+}
+
+const { blockNumber: openedBlockNumber } = await sendAndConfirm(openPosition.buildTx());
+
+const opened = await market.getPositionData(owner, { blockNumber: openedBlockNumber });
+console.log({
+  collateralWeth: formatUnits(opened.collateral, 18),
+  debtUsdc: formatUnits(opened.borrowAssets, 6),
+  borrowShares: opened.borrowShares.toString(),
+  healthy: opened.isHealthy,
+});
+```
+
+The post-transaction position read is pinned to the confirmed receipt block, so it reflects the final open-position transaction rather than a lagging latest-block response or the pre-transaction object.
+
+---
+
+## Fully repay and withdraw collateral
+
+Fetch the position again immediately before closing it. Passing the full fresh `borrowShares` balance asks Morpho to burn all debt shares. This is preferable to guessing an asset amount: interest and asset-to-share rounding can change while the transaction is pending, leaving debt dust when an exact asset amount is used.
+
+The combined SDK action repays first and then withdraws collateral. Its prerequisites include a bounded USDC approval for the amount required to repay the fresh shares and the Morpho authorization if it is not already present. The wallet must hold enough USDC to cover the accrued gross debt.
+
+```tsx
+const fresh = await market.getPositionData(owner);
+if (fresh.borrowShares === 0n) throw new Error("No debt to repay");
+
+const closePosition = market.repayWithdrawCollateral({
+  shares: fresh.borrowShares,
+  withdrawAmount: fresh.collateral,
+  userAddress: owner,
+  positionData: fresh,
+});
+
+for (const requirement of await closePosition.getRequirements()) {
+  if ("sign" in requirement) {
+    throw new Error("Unexpected signature requirement with supportSignature disabled");
+  }
+  await sendAndConfirm(requirement);
+}
+
+const { blockNumber: closedBlockNumber } = await sendAndConfirm(closePosition.buildTx());
+
+const closed = await market.getPositionData(owner, { blockNumber: closedBlockNumber });
+console.log({
+  collateralWeth: formatUnits(closed.collateral, 18),
+  debtUsdc: formatUnits(closed.borrowAssets, 6),
+  borrowShares: closed.borrowShares.toString(),
+});
+```
+
+The final position read is likewise pinned to the confirmed close-position receipt block.
+
+---
+
+## Origination fees
+
+A borrow product may charge an origination fee around the Morpho transaction path. Distinguish the **gross debt** opened on Morpho from the **net proceeds** delivered to the borrower: the difference goes to the disclosed fee recipient, interest accrues on the gross debt, and the fee consumes borrow capacity and changes liquidation risk. See Morpho's [monetization guide](https://docs.morpho.org/developers/borrow/guides/monetize-borrow-product/) for the required disclosure and risk considerations. The example contracts referenced there are educational and unaudited, not production-ready.
+
+This proof of concept does not implement fee routing. It also deliberately defers Morpho Midnight, rewards, the Public Allocator, dynamic market selection, gas sponsorship, Permit2, EIP-712, EIP-7702, and production fee routing.
+
+---
+
+## Summary
+
+You've now learned how to:
+
+- Create top-level transaction policies with a root client while a non-root Turnkey account signs.
+- Configure a complete, listed Morpho Blue market on Base and use the current Morpho viem extension.
+- Confirm prerequisite transactions before atomically supplying collateral and borrowing.
+- Read fresh position state, fully repay by borrow shares, and withdraw collateral.
+- Describe origination fees in terms of gross debt, net proceeds, fee recipient, interest, and borrow capacity.
+
+*Contributed by [Morpho](https://morpho.org)*
