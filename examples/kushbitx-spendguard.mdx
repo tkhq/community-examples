@@ -1,0 +1,237 @@
+---
+title: 'Use Turnkey wallets with KushBitx SpendGuard'
+sidebarTitle: "KushBitx SpendGuard integration"
+---
+
+## Overview
+
+[KushBitx](https://kushbitx.com) SpendGuard is a free, stateless policy preview for proposed Base USDC payments. Given a recipient, an amount and a spending policy (per-transaction limit, remaining daily budget, human-approval threshold, repeat limit and recipient allowlist), it returns an advisory decision: `APPROVE`, `HUMAN_APPROVAL` or `BLOCK`, with machine-readable reason codes. SpendGuard does not hold keys, sign, or execute anything.
+
+This guide walks through how to put SpendGuard in front of a **Turnkey** wallet in a client-side agent flow:
+
+1. Build an unsigned Base USDC transfer.
+2. Run the SpendGuard policy preview on the proposed payment.
+3. Enforce the decision in your own code.
+4. Pass the same, unchanged transaction to Turnkey for signing only when the decision is `APPROVE`.
+
+Turnkey remains the signer and its own policies stay authoritative. SpendGuard adds an independent check that runs before the signing request is made.
+
+---
+
+## Getting started
+
+Before you begin, make sure you've followed the [Turnkey Quickstart guide](https://docs.turnkey.com/getting-started/quickstart).
+You should have:
+
+- A Turnkey **organization** with an **API key pair**
+- A Turnkey **wallet account** on Base, funded with a small amount of USDC and ETH for gas
+- A recipient address you intend to pay, kept in an environment variable
+
+SpendGuard needs no API key and no account. The free endpoint is rate-limited per source (120 requests per hour at the time of writing).
+
+Environment variables used in this guide:
+
+```bash
+TURNKEY_API_BASE_URL=https://api.turnkey.com
+TURNKEY_API_PUBLIC_KEY=<your-api-public-key>
+TURNKEY_API_PRIVATE_KEY=<your-api-private-key>
+TURNKEY_ORGANIZATION_ID=<your-organization-id>
+TURNKEY_SIGN_WITH=<your-turnkey-wallet-account-address>
+PAYEE_ADDRESS=<recipient-address>
+```
+
+---
+
+## Install dependencies
+
+```bash
+npm install @turnkey/viem @turnkey/http @turnkey/api-key-stamper viem
+```
+
+---
+
+## Set up the Turnkey viem signer
+
+Create a viem account backed by your Turnkey wallet, and a wallet client on Base.
+
+```tsx
+import { createAccount } from "@turnkey/viem";
+import { TurnkeyClient } from "@turnkey/http";
+import { ApiKeyStamper } from "@turnkey/api-key-stamper";
+import { createWalletClient, http } from "viem";
+import { base } from "viem/chains";
+
+const turnkeyClient = new TurnkeyClient(
+  { baseUrl: process.env.TURNKEY_API_BASE_URL! },
+  new ApiKeyStamper({
+    apiPublicKey: process.env.TURNKEY_API_PUBLIC_KEY!,
+    apiPrivateKey: process.env.TURNKEY_API_PRIVATE_KEY!,
+  })
+);
+
+const turnkeyAccount = await createAccount({
+  client: turnkeyClient,
+  organizationId: process.env.TURNKEY_ORGANIZATION_ID!,
+  signWith: process.env.TURNKEY_SIGN_WITH!,
+});
+
+const walletClient = createWalletClient({
+  account: turnkeyAccount,
+  chain: base,
+  transport: http(),
+});
+```
+
+---
+
+## Build the unsigned USDC transfer
+
+Encode a standard ERC-20 `transfer` call to the USDC contract on Base. Nothing is signed yet. The fingerprint is a hash of the exact fields that will later be sent to Turnkey, so the code can confirm the payload did not change between the check and the signature.
+
+```tsx
+import {
+  encodeFunctionData,
+  erc20Abi,
+  getAddress,
+  keccak256,
+  parseUnits,
+  toHex,
+  type Address,
+  type Hex,
+} from "viem";
+
+// Circle's USDC token contract on Base (6 decimals)
+const USDC_BASE: Address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+
+const recipient = getAddress(process.env.PAYEE_ADDRESS!);
+const amount = "5.00"; // USDC, as a decimal string
+
+const unsignedTx = {
+  chainId: base.id,
+  to: USDC_BASE,
+  value: 0n,
+  data: encodeFunctionData({
+    abi: erc20Abi,
+    functionName: "transfer",
+    args: [recipient, parseUnits(amount, 6)],
+  }),
+};
+
+function fingerprint(tx: { chainId: number; to: Address; value: bigint; data: Hex }): Hex {
+  return keccak256(
+    toHex(JSON.stringify({ chainId: tx.chainId, to: tx.to.toLowerCase(), value: tx.value.toString(), data: tx.data }))
+  );
+}
+
+const checkedFingerprint = fingerprint(unsignedTx);
+```
+
+---
+
+## Run the SpendGuard policy preview
+
+Send the proposed payment and your policy to the free SpendGuard endpoint. The policy values below are examples; use the limits your application actually enforces.
+
+```tsx
+type SpendGuardDecision = "APPROVE" | "HUMAN_APPROVAL" | "BLOCK";
+
+interface SpendGuardResult {
+  decision: SpendGuardDecision;
+  reasonCodes: string[];
+  findings: { code: string; message: string }[];
+  decisionId: string;
+  advisory: boolean;
+  executionAuthorized: boolean;
+}
+
+const response = await fetch("https://kushbitx.com/api/spendguard/evaluate", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({
+    agentId: "treasury-agent",
+    requestId: crypto.randomUUID(),
+    chain: "base",
+    asset: "USDC",
+    recipient,
+    amount,
+    policy: {
+      maxPerTransaction: "25.00",
+      remainingDailyBudget: "100.00",
+      requireHumanAbove: "20.00",
+      maxRepeats: 3,
+      allowedRecipients: [recipient],
+      blockUnknownRecipients: true,
+      // Policy-only mode: decide on these limits alone, with no paid evidence.
+      applyAgentProof: false,
+    },
+    context: { repeatCount: 0 },
+  }),
+});
+
+if (response.status === 429) {
+  throw new Error(`SpendGuard rate limit reached; retry after ${response.headers.get("retry-after")}s`);
+}
+if (!response.ok) {
+  throw new Error(`SpendGuard returned ${response.status}: ${await response.text()}`);
+}
+
+const result: SpendGuardResult = await response.json();
+console.log(result.decision, result.reasonCodes, result.decisionId);
+```
+
+With `applyAgentProof: false`, the decision rests on your policy alone and the whole flow is free. A payment within the limits to an allowed recipient returns `APPROVE`. A recipient outside `allowedRecipients` returns `BLOCK` with `RECIPIENT_NOT_ALLOWED`. An amount above `requireHumanAbove` returns `HUMAN_APPROVAL` with `HUMAN_THRESHOLD`. The response always carries `advisory: true` and `executionAuthorized: false`: the decision is input to your code, not an authorization.
+
+---
+
+## Enforce the decision and sign with Turnkey
+
+Only an `APPROVE` decision reaches Turnkey. Before signing, recompute the fingerprint so that any change to the payload after the check stops the flow; a changed payload needs a fresh check.
+
+```tsx
+async function signIfApproved(result: SpendGuardResult): Promise<Hex | null> {
+  switch (result.decision) {
+    case "BLOCK":
+      console.error("Blocked by policy:", result.reasonCodes.join(", "));
+      return null;
+
+    case "HUMAN_APPROVAL":
+      // Hand off to your own review queue; do not sign automatically.
+      console.warn("Needs human approval:", result.reasonCodes.join(", "), result.decisionId);
+      return null;
+
+    case "APPROVE": {
+      if (fingerprint(unsignedTx) !== checkedFingerprint) {
+        throw new Error("Transaction changed after the SpendGuard check; run the check again.");
+      }
+      // Turnkey signs the payload it is handed; its own policies still apply.
+      return walletClient.sendTransaction({
+        to: unsignedTx.to,
+        data: unsignedTx.data,
+        value: unsignedTx.value,
+      });
+    }
+  }
+}
+
+const txHash = await signIfApproved(result);
+if (txHash) console.log("Submitted:", `https://basescan.org/tx/${txHash}`);
+```
+
+### Optional: add transaction evidence
+
+This guide does not require any payment. If you also want the transaction itself simulated before signing, the SpendGuard response lists optional paid checks in `paidOptions`, such as Simulation Check (`transaction-preflight`, 0.001 USDC via x402). Nothing is charged automatically. To use it, remove `applyAgentProof: false` and pass its verdict as `context.agentProofDecision`; without that evidence SpendGuard returns `HUMAN_APPROVAL`. See the [KushBitx quickstart](https://kushbitx.com/quickstart) for details.
+
+---
+
+## Summary
+
+You've now learned how to:
+
+- Create a viem wallet client backed by a Turnkey wallet on Base
+- Build an unsigned USDC transfer and fingerprint the exact payload
+- Run the free KushBitx SpendGuard policy preview before any signing request
+- Enforce `APPROVE`, `HUMAN_APPROVAL` and `BLOCK` in your own code, and send only an unchanged, approved payload to Turnkey for signing
+
+---
+
+*Contributed by [KushBitx](https://kushbitx.com)*
