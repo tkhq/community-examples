@@ -1,0 +1,85 @@
+---
+title: 'Use Turnkey wallets with AllSwap'
+sidebarTitle: "AllSwap integration"
+---
+
+## Overview
+
+[AllSwap](https://allswap.io/) is a non-custodial cross-chain cryptocurrency exchange protocol supporting 40+ native blockchains (including Bitcoin, Solana, TRON, TON, and EVM networks) via single-use deposit routing. By combining Turnkey's secure key-management infrastructure (`@turnkey/sdk-server`) with the [AllSwap Partner API v2](https://allswap.io/docs), developers can programmatically fetch cross-chain quotes, validate destination addresses, and sign settlement transactions without exposing raw private keys.
+
+## Getting started
+
+Before you begin, ensure you have:
+- A [Turnkey organization](https://app.turnkey.com/) with an API key pair (`TURNKEY_API_PUBLIC_KEY`, `TURNKEY_API_PRIVATE_KEY`) and Organization ID (`TURNKEY_ORGANIZATION_ID`).
+- A funded Turnkey EVM or Solana wallet address for the source leg of the swap.
+- Node.js 18+ installed.
+
+## Install dependencies
+
+```bash
+npm install @turnkey/sdk-server viem
+```
+
+## Setting up the Turnkey wallet
+
+Initialize the Turnkey server SDK using environment variables (never hardcode keys or organization IDs):
+
+```tsx
+import { Turnkey } from "@turnkey/sdk-server";
+
+const turnkey = new Turnkey({
+  apiBaseUrl: "https://api.turnkey.com",
+  apiPublicKey: process.env.TURNKEY_API_PUBLIC_KEY!,
+  apiPrivateKey: process.env.TURNKEY_API_PRIVATE_KEY!,
+  defaultOrganizationId: process.env.TURNKEY_ORGANIZATION_ID!,
+});
+
+const apiClient = turnkey.apiClient();
+```
+
+## Fetching a non-custodial cross-chain swap quote
+
+Query the AllSwap Partner API v2 (`https://api.allswap.io/v2`) to retrieve a deterministic quote and ephemeral single-use deposit address for swapping from EVM to a native destination chain:
+
+```tsx
+async function getAllSwapQuote(amount: string) {
+  const url = new URL("https://api.allswap.io/v2/quote");
+  url.searchParams.set("fromChain", "ethereum");
+  url.searchParams.set("toChain", "solana");
+  url.searchParams.set("fromToken", "ETH");
+  url.searchParams.set("toToken", "SOL");
+  url.searchParams.set("amount", amount);
+
+  const response = await fetch(url.toString(), {
+    headers: { "Content-Type": "application/json" },
+  });
+  if (!response.ok) {
+    throw new Error(`AllSwap API error: ${response.status}`);
+  }
+  return response.json();
+}
+```
+
+## Signing the deposit transaction via Turnkey
+
+Once you obtain the ephemeral single-use deposit address from the swap route response, use Turnkey's `signTransaction` API to sign the source transfer without raw key material ever leaving Turnkey's enclaves:
+
+```tsx
+async function signDepositWithTurnkey(signWithAddress: string, unsignedTxHex: string) {
+  const signed = await apiClient.signTransaction({
+    signWith: signWithAddress,
+    type: "TRANSACTION_TYPE_ETHEREUM",
+    unsignedTransaction: unsignedTxHex,
+  });
+  return signed.signedTransaction;
+}
+```
+
+## Summary
+
+In this guide, you learned how to:
+- Initialize `@turnkey/sdk-server` cleanly using environment variables.
+- Query non-custodial cross-chain swap quotes from `https://api.allswap.io/v2`.
+- Sign single-use deposit transactions securely inside Turnkey enclaves without exposing private keys.
+
+*Contributed by AllSwap Protocol.*
