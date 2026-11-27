@@ -54,6 +54,7 @@ This repo is a submodule of the [tkhq/docs](https://github.com/tkhq/docs) reposi
 | [Morpho Blue Borrow](./examples/morpho-blue-borrow.mdx) | Supply collateral, borrow, repay, and withdraw on Morpho Blue using a policy-controlled Turnkey account | Morpho |
 | [Zama Confidential Tokens](./examples/zama-confidential-tokens.mdx) | Shield, transfer, and unshield ERC-20 tokens with on-chain FHE encryption using Turnkey wallets | Zama |
 | [Compass](./examples/compass.mdx) | Build DeFi transactions across yield, credit, RWAs, and perps — Aave, Morpho, Pendle, Ondo and more — with the Compass API, signed by Turnkey wallets | Compass Labs |
+| [AllSwap](./examples/allswap-cross-chain-swap.mdx) | Fetch non-custodial cross-chain swap quotes across 40+ native blockchains via AllSwap Partner API v2 and sign single-use deposit transactions using Turnkey wallets | AllSwap Protocol |
 
 ---
 
